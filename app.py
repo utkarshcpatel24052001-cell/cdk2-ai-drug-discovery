@@ -14,49 +14,62 @@ import streamlit as st
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem, Descriptors, Draw, QED, rdMolDescriptors
 
-
 # =========================
 # CONFIG (CDK2 only)
 # =========================
 PROJECT = Path(__file__).resolve().parent
 
-# Support both repo layouts:
-# - old: ./cdk2_pic50_clean.parquet
-# - new: ./data_processed/cdk2_pic50_clean.parquet
-DATA_PATHS = [
-    PROJECT / "data_processed" / "cdk2_pic50_clean.parquet",
-    PROJECT / "cdk2_pic50_clean.parquet",
-]
+# Dataset file is currently in your repo root (based on your repo contents)
+DATA_PATH = PROJECT / "cdk2_pic50_clean.parquet"
 
-MODEL_PATHS = [
-    PROJECT / "models" / "cdk2_rf_final_all_data.joblib",
-    PROJECT / "cdk2_rf_final_all_data.joblib",
-]
+# Model will be downloaded to this local path (do NOT commit the 139MB file to GitHub)
+MODEL_PATH = PROJECT / "models" / "cdk2_rf_final_all_data.joblib"
+
+# Google Drive direct-download URL (uc?id=FILE_ID)
+MODEL_DRIVE_URL = "https://drive.google.com/uc?id=1pOgZVHG7BfrcXE7ZmHJNM9CMnsBNlCQa"
 
 FP_RADIUS = 2
 FP_NBITS = 2048
 
+# Similarity thresholds (Applicability Domain)
 SIM_HIGH = 0.50
 SIM_MED = 0.30
 
 st.set_page_config(page_title="ChemBLitz — CDK2 Scientific Predictor", layout="wide")
 
 
-def first_existing_path(paths: list[Path]) -> Optional[Path]:
-    for p in paths:
-        if p.exists():
-            return p
-    return None
+# =========================
+# Download helper (Google Drive)
+# =========================
+def ensure_model_present(model_path: Path) -> None:
+    """
+    Ensure the model file exists locally.
+    If missing, download from Google Drive using gdown (first run only).
+    """
+    if model_path.exists():
+        return
 
+    model_path.parent.mkdir(parents=True, exist_ok=True)
 
-DATA_PATH = first_existing_path(DATA_PATHS)
-MODEL_PATH = first_existing_path(MODEL_PATHS)
+    try:
+        import gdown  # type: ignore
+    except Exception as e:
+        raise RuntimeError("gdown is not installed. Add `gdown` to requirements.txt") from e
+
+    with st.spinner("Downloading model from Google Drive (first run only)…"):
+        out = gdown.download(MODEL_DRIVE_URL, str(model_path), quiet=False, fuzzy=True)
+        if (not out) or (not model_path.exists()):
+            raise RuntimeError(
+                "Model download failed. "
+                "Check that Google Drive sharing is set to: Anyone with the link = Viewer."
+            )
 
 
 # =========================
 # Helpers
 # =========================
 def pic50_to_ic50_nM(pic50: float) -> float:
+    # IC50 (nM) = 10^(9 - pIC50)
     return float(10 ** (9.0 - pic50))
 
 
@@ -136,6 +149,7 @@ def potency_bucket(pic50: float) -> str:
 
 @st.cache_data(show_spinner=False)
 def chembl_pref_name_from_chembl_id(chembl_id: str) -> Optional[str]:
+    # ChEMBL REST API: molecule endpoint
     try:
         url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{chembl_id}.json"
         r = requests.get(url, timeout=10)
@@ -148,14 +162,20 @@ def chembl_pref_name_from_chembl_id(chembl_id: str) -> Optional[str]:
         return None
 
 
+# =========================
+# Model + data
+# =========================
 @st.cache_data
-def load_data(path: Path) -> pd.DataFrame:
-    return pd.read_parquet(path)
+def load_data() -> pd.DataFrame:
+    df = pd.read_parquet(DATA_PATH)
+    # Expected columns: inchikey, smiles, molecule_chembl_id, pic50, ic50_nM, n_measurements
+    return df
 
 
 @st.cache_resource
-def load_model(path: Path):
-    return joblib.load(path)
+def load_model():
+    ensure_model_present(MODEL_PATH)
+    return joblib.load(MODEL_PATH)
 
 
 @st.cache_resource
@@ -202,8 +222,10 @@ def improvement_suggestions(d: dict, max_sim: float) -> list[str]:
 
 
 def build_real_examples_from_dataset(df: pd.DataFrame) -> dict[str, str]:
-    # Build “real” CDK2 examples directly from dataset (guaranteed CDK2-relevant).
-    # Uses molecule_chembl_id if available, else InChIKey as label.
+    """
+    Build “real CDK2-related examples” directly from the dataset:
+    strongest, median, weakest, most measured.
+    """
     out: dict[str, str] = {}
 
     dff = df.dropna(subset=["pic50", "smiles"]).copy()
@@ -232,7 +254,7 @@ def build_real_examples_from_dataset(df: pd.DataFrame) -> dict[str, str]:
         label = f"Weak binder (pIC50 {r['pic50']:.2f}) — {r.get('molecule_chembl_id','')}".strip(" —")
         out[label] = str(r["smiles"])
 
-    # Most measured (quality)
+    # Most measured
     if "n_measurements" in dff.columns:
         mq = dff.sort_values("n_measurements", ascending=False).head(1)
         if len(mq):
@@ -240,9 +262,9 @@ def build_real_examples_from_dataset(df: pd.DataFrame) -> dict[str, str]:
             label = f"Most measured (n={int(r['n_measurements'])}) — {r.get('molecule_chembl_id','')}".strip(" —")
             out[label] = str(r["smiles"])
 
-    # Always include a simple fallback if something goes wrong
     if not out:
         out["Dataset example"] = str(df.iloc[0]["smiles"])
+
     return out
 
 
@@ -250,25 +272,20 @@ def build_real_examples_from_dataset(df: pd.DataFrame) -> dict[str, str]:
 # UI
 # =========================
 st.title("ChemBLitz — CDK2 pIC50 Scientific Predictor")
-
-if DATA_PATH is None:
-    st.error("Dataset parquet not found. Expected either `data_processed/cdk2_pic50_clean.parquet` or `cdk2_pic50_clean.parquet`.")
-    st.stop()
-if MODEL_PATH is None:
-    st.error("Model file not found. Expected either `models/cdk2_rf_final_all_data.joblib` or `cdk2_rf_final_all_data.joblib`.")
-    st.stop()
-
-df = load_data(DATA_PATH)
-model = load_model(MODEL_PATH)
-
 st.caption(
     "CDK2-only. Prediction + uncertainty + applicability-domain checks + nearest-neighbor evidence + ADMET-like heuristics. "
-    "Examples are selected from the CDK2 dataset (real CDK2-related compounds)."
+    "Model is downloaded from Google Drive on first run."
 )
 
-# Single SMILES state
+if not DATA_PATH.exists():
+    st.error(f"Dataset not found: {DATA_PATH} (expected in repo root)")
+    st.stop()
+
+df = load_data()
+
+# Initialize SMILES in session
 if "smiles" not in st.session_state:
-    st.session_state["smiles"] = "CCO"
+    st.session_state["smiles"] = str(df.iloc[0]["smiles"]) if "smiles" in df.columns else "CCO"
 
 examples = build_real_examples_from_dataset(df)
 
@@ -279,6 +296,7 @@ with tab_pred:
 
     with c_left:
         st.subheader("Input")
+
         ex = st.selectbox("Load CDK2 dataset example", list(examples.keys()), index=0)
         if st.button("Use selected example"):
             st.session_state["smiles"] = examples[ex]
@@ -302,17 +320,18 @@ with tab_pred:
             & (df["pic50"] <= pic50_range[1])
             & (df["n_measurements"] >= min_n)
         ].copy()
-        st.info(f"Filtered dataset size: {len(df_f)} / {len(df)}")
 
-        st.markdown("**Filter impact (what changed?)**")
-        st.write("- pIC50 range filter keeps only compounds within the chosen potency range.")
-        st.write("- Min measurements keeps only compounds with more experimental support (higher label reliability).")
+        st.info(f"Filtered dataset size: {len(df_f)} / {len(df)}")
 
     with c_right:
         st.subheader("Output (scientific)")
+
         if not run:
             st.info("Click **Predict** to generate outputs.")
         else:
+            # Load model only when needed (prevents first-run download when user hasn't clicked Predict)
+            model = load_model()
+
             smiles = st.session_state["smiles"]
             mol = mol_from_smiles(smiles)
             if mol is None:
@@ -327,10 +346,11 @@ with tab_pred:
             st.code(can, language="text")
             st.write("InChIKey:", ik)
 
-            # Local dataset match
-            local_match = df[df["inchikey"].astype(str) == ik]
+            # Local dataset match + filter inclusion
+            local_match = df[df["inchikey"].astype(str) == ik] if "inchikey" in df.columns else pd.DataFrame()
             chembl_id = None
             input_is_in_dataset = len(local_match) > 0
+
             if input_is_in_dataset:
                 row0 = local_match.iloc[0]
                 chembl_id = str(row0.get("molecule_chembl_id", "")).strip() or None
@@ -338,15 +358,12 @@ with tab_pred:
             else:
                 st.warning("Not found in dataset (by InChIKey).")
 
-            # Is it in filtered set?
             input_in_filtered = False
-            if input_is_in_dataset:
+            if input_is_in_dataset and "inchikey" in df_f.columns:
                 input_in_filtered = len(df_f[df_f["inchikey"].astype(str) == ik]) > 0
-
-            if input_is_in_dataset:
                 st.write("Included after filters:", "✅ Yes" if input_in_filtered else "❌ No (excluded by current filters)")
 
-            # Name (preferred) + nomenclature fallback
+            # Name (preferred) + nomenclature identifier fallback
             pref = chembl_pref_name_from_chembl_id(chembl_id) if chembl_id else None
             if pref:
                 st.write("Compound name (ChEMBL pref_name):", pref)
@@ -355,7 +372,7 @@ with tab_pred:
             else:
                 st.write("Compound name:", "Unknown (showing canonical identifiers instead)")
 
-            st.caption("Identifiers shown (canonical SMILES + InChIKey) are valid chemical nomenclature identifiers.")
+            st.caption("Canonical SMILES + InChIKey are stable chemical identifiers (nomenclature-style).")
 
             # Predict
             fp = morgan_fp(mol)
@@ -363,8 +380,8 @@ with tab_pred:
             pred_pic50, pred_std = rf_predict_with_uncertainty(model, X)
             pred_ic50 = pic50_to_ic50_nM(pred_pic50)
 
-            # Applicability domain vs full dataset
-            fps_all, idx_map_all = build_dataset_fps(df)
+            # Similarity for applicability domain (FULL dataset)
+            fps_all, _idx_map_all = build_dataset_fps(df)
             sims_all = np.array(DataStructs.BulkTanimotoSimilarity(fp, fps_all), dtype=float) if len(fps_all) else np.array([])
             max_sim = float(sims_all.max()) if len(sims_all) else 0.0
             mean_sim = float(sims_all.mean()) if len(sims_all) else 0.0
@@ -382,8 +399,9 @@ with tab_pred:
                 st.warning(f"Borderline domain (max similarity: {max_sim:.3f})")
             else:
                 st.error(f"Out-of-domain risk (max similarity: {max_sim:.3f})")
-            st.write(f"Mean similarity (dataset): {mean_sim:.3f}")
+
             conf = confidence_label(pred_std, max_sim)
+            st.write(f"Mean similarity (dataset): {mean_sim:.3f}")
             st.write("Confidence:", conf)
 
             st.markdown("### PhysChem + ADMET-like heuristics")
@@ -412,7 +430,7 @@ with tab_pred:
             if ro5 >= 2:
                 flags.append("Multiple Lipinski violations.")
             if not veber_pass(d):
-                flags.append("Veber rule failed (permeability risk).")
+                flags.append("Veber rule failed (permeability/performance risk).")
 
             if not flags:
                 st.success("Overall: Suitable for screening. Next: selectivity + solubility + metabolic stability checks.")
@@ -423,26 +441,60 @@ with tab_pred:
             for s in improvement_suggestions(d, max_sim):
                 st.write(f"- {s}")
 
+            with st.expander("How to interpret these metrics (quick guide)"):
+                st.markdown(
+                    """
+- **pIC50 / IC50:** potency prediction for CDK2. Higher pIC50 (lower IC50) is stronger inhibition.
+- **Uncertainty (σ):** consistency across RF trees (proxy for uncertainty). Lower is better.
+- **Similarity (Tanimoto):** how close your molecule is to training data. Low similarity ⇒ out-of-domain.
+- **MolWt, cLogP, TPSA, RotB, HBD/HBA:** medicinal chemistry properties related to absorption/permeability.
+- **QED:** drug-likeness (higher is better).
+                    """
+                )
+
 with tab_val:
     st.subheader("Nearest-neighbor evidence (updates with current SMILES)")
+
     smiles = st.session_state["smiles"]
     mol_q = mol_from_smiles(smiles)
 
-    use_filtered = st.toggle("Use filtered dataset for neighbors", value=False, help="Turn ON to restrict neighbor evidence to the filtered subset.")
-    df_nn = df_f if use_filtered else df
+    use_filtered = st.toggle(
+        "Use filtered dataset for neighbors",
+        value=False,
+        help="Turn ON to restrict neighbor evidence to the filtered subset.",
+    )
+    # Use the same filters computed in Predict tab if available; otherwise default to full df
+    # (When user hasn't pressed Predict yet, df_f isn't created; we handle gracefully.)
+    df_nn = df
+
+    # Recompute filters here as well (so the tab is independent)
+    pic50_min, pic50_max = float(df["pic50"].min()), float(df["pic50"].max())
+    # Use same defaults; user-adjusted values persist because Streamlit stores widget state
+    pic50_range = st.slider("pIC50 range (neighbors)", pic50_min, pic50_max, (pic50_min, pic50_max), key="nn_pic50")
+    min_n = st.slider("Min measurements (neighbors)", 1, int(df["n_measurements"].max()), 1, key="nn_min_n")
+
+    df_f2 = df[
+        (df["pic50"] >= pic50_range[0])
+        & (df["pic50"] <= pic50_range[1])
+        & (df["n_measurements"] >= min_n)
+    ].copy()
+
+    if use_filtered:
+        df_nn = df_f2
 
     if mol_q is None:
         st.error("Invalid SMILES.")
     else:
         fp_q = morgan_fp(mol_q)
         fps_nn, idx_map_nn = build_dataset_fps(df_nn)
-        sims = np.array(DataStructs.BulkTanimotoSimilarity(fp_q, fps_nn), dtype=float) if len(fps_nn) else np.array([])
 
-        if len(sims) == 0:
-            st.warning("No valid fingerprints found in selected neighbor set.")
+        if len(fps_nn) == 0:
+            st.warning("No valid fingerprints in the selected neighbor set.")
         else:
+            sims = np.array(DataStructs.BulkTanimotoSimilarity(fp_q, fps_nn), dtype=float)
             topk = 10
             top = np.argsort(-sims)[:topk]
+
             rows = []
             for j in top:
                 row = df_nn.iloc[int(idx_map_nn[j])]
@@ -461,7 +513,17 @@ with tab_val:
 with tab_data:
     st.subheader("Dataset dashboard (full vs filtered)")
 
-    st.write("Full dataset vs filtered dataset distributions show what your filters are doing.")
+    st.write("These plots show how your filters change which compounds are included.")
+
+    pic50_min, pic50_max = float(df["pic50"].min()), float(df["pic50"].max())
+    pic50_range = st.slider("pIC50 range (dashboard)", pic50_min, pic50_max, (pic50_min, pic50_max), key="dash_pic50")
+    min_n = st.slider("Min measurements (dashboard)", 1, int(df["n_measurements"].max()), 1, key="dash_min_n")
+
+    df_f = df[
+        (df["pic50"] >= pic50_range[0])
+        & (df["pic50"] <= pic50_range[1])
+        & (df["n_measurements"] >= min_n)
+    ].copy()
 
     c1, c2 = st.columns(2)
     with c1:
@@ -473,6 +535,9 @@ with tab_data:
 
     fig3 = px.histogram(df, x="n_measurements", nbins=30, title="n_measurements (FULL)")
     st.plotly_chart(fig3, use_container_width=True)
+
+    st.markdown("### Preview (filtered)")
+    st.dataframe(df_f.head(50), use_container_width=True)
 
 with tab_about:
     st.subheader("Methodology (scientific context)")
@@ -488,10 +553,11 @@ with tab_about:
 - Fingerprints: radius=2, 2048 bits  
 - Uncertainty proxy: std across RF trees
 
-**Examples:**
-- Example molecules are selected from the CDK2 dataset itself (real target-relevant compounds).
+**Applicability domain:**  
+- Uses Tanimoto similarity to dataset molecules.  
+- Low similarity indicates limited training support for that chemistry.
 
-**Notes:**
-- Compound “name” may be missing for some ChEMBL IDs; in that case we display stable identifiers.
+**Model hosting:**  
+- The model file is downloaded from Google Drive on first run (so it doesn't need to be committed to GitHub).
         """
     )
