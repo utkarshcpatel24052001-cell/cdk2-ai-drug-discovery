@@ -19,24 +19,44 @@ from rdkit.Chem import AllChem, Descriptors, Draw, QED, rdMolDescriptors
 # CONFIG (CDK2 only)
 # =========================
 PROJECT = Path(__file__).resolve().parent
-DATA_PATH = PROJECT / "data_processed" / "cdk2_pic50_clean.parquet"
-MODEL_PATH = PROJECT / "models" / "cdk2_rf_final_all_data.joblib"
+
+# Support both repo layouts:
+# - old: ./cdk2_pic50_clean.parquet
+# - new: ./data_processed/cdk2_pic50_clean.parquet
+DATA_PATHS = [
+    PROJECT / "data_processed" / "cdk2_pic50_clean.parquet",
+    PROJECT / "cdk2_pic50_clean.parquet",
+]
+
+MODEL_PATHS = [
+    PROJECT / "models" / "cdk2_rf_final_all_data.joblib",
+    PROJECT / "cdk2_rf_final_all_data.joblib",
+]
 
 FP_RADIUS = 2
 FP_NBITS = 2048
 
-# Similarity thresholds (Applicability Domain)
 SIM_HIGH = 0.50
 SIM_MED = 0.30
 
 st.set_page_config(page_title="ChemBLitz — CDK2 Scientific Predictor", layout="wide")
 
 
+def first_existing_path(paths: list[Path]) -> Optional[Path]:
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
+
+DATA_PATH = first_existing_path(DATA_PATHS)
+MODEL_PATH = first_existing_path(MODEL_PATHS)
+
+
 # =========================
 # Helpers
 # =========================
 def pic50_to_ic50_nM(pic50: float) -> float:
-    # IC50 (nM) = 10^(9 - pIC50)
     return float(10 ** (9.0 - pic50))
 
 
@@ -116,8 +136,6 @@ def potency_bucket(pic50: float) -> str:
 
 @st.cache_data(show_spinner=False)
 def chembl_pref_name_from_chembl_id(chembl_id: str) -> Optional[str]:
-    # ChEMBL REST API: molecule endpoint
-    # Example: https://www.ebi.ac.uk/chembl/api/data/molecule/CHEMBL25.json
     try:
         url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{chembl_id}.json"
         r = requests.get(url, timeout=10)
@@ -130,19 +148,14 @@ def chembl_pref_name_from_chembl_id(chembl_id: str) -> Optional[str]:
         return None
 
 
-# =========================
-# Model + data
-# =========================
 @st.cache_data
-def load_data() -> pd.DataFrame:
-    df = pd.read_parquet(DATA_PATH)
-    # Expected columns: inchikey, smiles, molecule_chembl_id, pic50, ic50_nM, n_measurements
-    return df
+def load_data(path: Path) -> pd.DataFrame:
+    return pd.read_parquet(path)
 
 
 @st.cache_resource
-def load_model():
-    return joblib.load(MODEL_PATH)
+def load_model(path: Path):
+    return joblib.load(path)
 
 
 @st.cache_resource
@@ -174,49 +187,90 @@ def confidence_label(pred_std: float, max_sim: float) -> str:
 def improvement_suggestions(d: dict, max_sim: float) -> list[str]:
     s = []
     if d["LogP"] > 4.5:
-        s.append("Reduce hydrophobicity (LogP high): add polarity (HBA/HBD) or remove hydrophobic ring/alkyl groups.")
+        s.append("LogP high → consider adding polarity (HBA/HBD) or removing hydrophobic ring/alkyl groups.")
     if d["TPSA"] > 140:
-        s.append("TPSA high: may reduce permeability; consider reducing polar groups or masking (prodrug strategy).")
+        s.append("TPSA high → may reduce permeability; consider reducing polar groups or masking (prodrug strategy).")
     if d["RotB"] > 10:
-        s.append("Too flexible: reduce rotatable bonds via ring closure / rigidification.")
+        s.append("Too flexible → reduce rotatable bonds via ring closure / rigidification.")
     if d["MolWt"] > 500:
-        s.append("MolWt high: consider scaffold simplification to improve developability.")
+        s.append("MolWt high → consider scaffold simplification.")
     if max_sim < SIM_MED:
-        s.append("Low similarity to training data: prediction is out-of-domain; prioritize experimental validation.")
+        s.append("Out-of-domain risk → low similarity to known CDK2 data; treat prediction cautiously.")
     if not s:
-        s.append("No major red flags: next focus on selectivity, solubility, and metabolic stability.")
+        s.append("No major red flags → next focus on selectivity, solubility, and metabolic stability.")
     return s
+
+
+def build_real_examples_from_dataset(df: pd.DataFrame) -> dict[str, str]:
+    # Build “real” CDK2 examples directly from dataset (guaranteed CDK2-relevant).
+    # Uses molecule_chembl_id if available, else InChIKey as label.
+    out: dict[str, str] = {}
+
+    dff = df.dropna(subset=["pic50", "smiles"]).copy()
+    dff["pic50"] = pd.to_numeric(dff["pic50"], errors="coerce")
+    dff = dff.dropna(subset=["pic50"])
+
+    # Top potency
+    top = dff.sort_values("pic50", ascending=False).head(1)
+    if len(top):
+        r = top.iloc[0]
+        label = f"Top binder (pIC50 {r['pic50']:.2f}) — {r.get('molecule_chembl_id','')}".strip(" —")
+        out[label] = str(r["smiles"])
+
+    # Median potency
+    med_pic = float(dff["pic50"].median())
+    med_row = dff.iloc[(dff["pic50"] - med_pic).abs().argsort()[:1]]
+    if len(med_row):
+        r = med_row.iloc[0]
+        label = f"Median binder (pIC50 ~{med_pic:.2f}) — {r.get('molecule_chembl_id','')}".strip(" —")
+        out[label] = str(r["smiles"])
+
+    # Low potency
+    low = dff.sort_values("pic50", ascending=True).head(1)
+    if len(low):
+        r = low.iloc[0]
+        label = f"Weak binder (pIC50 {r['pic50']:.2f}) — {r.get('molecule_chembl_id','')}".strip(" —")
+        out[label] = str(r["smiles"])
+
+    # Most measured (quality)
+    if "n_measurements" in dff.columns:
+        mq = dff.sort_values("n_measurements", ascending=False).head(1)
+        if len(mq):
+            r = mq.iloc[0]
+            label = f"Most measured (n={int(r['n_measurements'])}) — {r.get('molecule_chembl_id','')}".strip(" —")
+            out[label] = str(r["smiles"])
+
+    # Always include a simple fallback if something goes wrong
+    if not out:
+        out["Dataset example"] = str(df.iloc[0]["smiles"])
+    return out
 
 
 # =========================
 # UI
 # =========================
 st.title("ChemBLitz — CDK2 pIC50 Scientific Predictor")
+
+if DATA_PATH is None:
+    st.error("Dataset parquet not found. Expected either `data_processed/cdk2_pic50_clean.parquet` or `cdk2_pic50_clean.parquet`.")
+    st.stop()
+if MODEL_PATH is None:
+    st.error("Model file not found. Expected either `models/cdk2_rf_final_all_data.joblib` or `cdk2_rf_final_all_data.joblib`.")
+    st.stop()
+
+df = load_data(DATA_PATH)
+model = load_model(MODEL_PATH)
+
 st.caption(
-    "CDK2-only. Provides prediction, uncertainty, applicability-domain checks, nearest-neighbor evidence, "
-    "and ADMET-like heuristics. Compound names are fetched from ChEMBL when available."
+    "CDK2-only. Prediction + uncertainty + applicability-domain checks + nearest-neighbor evidence + ADMET-like heuristics. "
+    "Examples are selected from the CDK2 dataset (real CDK2-related compounds)."
 )
 
-if not DATA_PATH.exists():
-    st.error(f"Dataset not found: {DATA_PATH}")
-    st.stop()
-
-if not MODEL_PATH.exists():
-    st.error(f"Model not found: {MODEL_PATH}")
-    st.stop()
-
-df = load_data()
-model = load_model()
-
-# Single source of truth for SMILES across tabs
+# Single SMILES state
 if "smiles" not in st.session_state:
     st.session_state["smiles"] = "CCO"
 
-examples = {
-    "Aspirin": "CC(=O)Oc1ccccc1C(=O)O",
-    "Caffeine": "Cn1cnc2n(C)c(=O)n(C)c(=O)c12",
-    "Ethanol": "CCO",
-}
+examples = build_real_examples_from_dataset(df)
 
 tab_pred, tab_val, tab_data, tab_about = st.tabs(["Predict", "Validate (Similarity)", "Dataset Dashboard", "Methodology"])
 
@@ -225,7 +279,7 @@ with tab_pred:
 
     with c_left:
         st.subheader("Input")
-        ex = st.selectbox("Load example", list(examples.keys()), index=0)
+        ex = st.selectbox("Load CDK2 dataset example", list(examples.keys()), index=0)
         if st.button("Use selected example"):
             st.session_state["smiles"] = examples[ex]
 
@@ -238,7 +292,7 @@ with tab_pred:
         run = st.button("Predict", type="primary")
 
         st.markdown("---")
-        st.subheader("Dataset filters (used for nearest-neighbor evidence)")
+        st.subheader("Dataset filters (affect filtered dashboard + optional filtered neighbors)")
         pic50_min, pic50_max = float(df["pic50"].min()), float(df["pic50"].max())
         pic50_range = st.slider("pIC50 range", pic50_min, pic50_max, (pic50_min, pic50_max))
         min_n = st.slider("Min measurements per compound", 1, int(df["n_measurements"].max()), 1)
@@ -248,8 +302,11 @@ with tab_pred:
             & (df["pic50"] <= pic50_range[1])
             & (df["n_measurements"] >= min_n)
         ].copy()
-
         st.info(f"Filtered dataset size: {len(df_f)} / {len(df)}")
+
+        st.markdown("**Filter impact (what changed?)**")
+        st.write("- pIC50 range filter keeps only compounds within the chosen potency range.")
+        st.write("- Min measurements keeps only compounds with more experimental support (higher label reliability).")
 
     with c_right:
         st.subheader("Output (scientific)")
@@ -273,16 +330,32 @@ with tab_pred:
             # Local dataset match
             local_match = df[df["inchikey"].astype(str) == ik]
             chembl_id = None
-            if len(local_match) > 0:
+            input_is_in_dataset = len(local_match) > 0
+            if input_is_in_dataset:
                 row0 = local_match.iloc[0]
                 chembl_id = str(row0.get("molecule_chembl_id", "")).strip() or None
-                st.success(f"Found in local dataset: {chembl_id or 'N/A'}")
+                st.success(f"Found in dataset: {chembl_id or 'N/A'}")
             else:
-                st.warning("Not found in local dataset (by InChIKey).")
+                st.warning("Not found in dataset (by InChIKey).")
 
-            # Compound name from ChEMBL (if available)
-            name = chembl_pref_name_from_chembl_id(chembl_id) if chembl_id else None
-            st.write("Compound name:", name if name else "Unknown / not available")
+            # Is it in filtered set?
+            input_in_filtered = False
+            if input_is_in_dataset:
+                input_in_filtered = len(df_f[df_f["inchikey"].astype(str) == ik]) > 0
+
+            if input_is_in_dataset:
+                st.write("Included after filters:", "✅ Yes" if input_in_filtered else "❌ No (excluded by current filters)")
+
+            # Name (preferred) + nomenclature fallback
+            pref = chembl_pref_name_from_chembl_id(chembl_id) if chembl_id else None
+            if pref:
+                st.write("Compound name (ChEMBL pref_name):", pref)
+            elif chembl_id:
+                st.write("Compound name:", f"ChEMBL compound {chembl_id} (no pref_name available)")
+            else:
+                st.write("Compound name:", "Unknown (showing canonical identifiers instead)")
+
+            st.caption("Identifiers shown (canonical SMILES + InChIKey) are valid chemical nomenclature identifiers.")
 
             # Predict
             fp = morgan_fp(mol)
@@ -290,7 +363,7 @@ with tab_pred:
             pred_pic50, pred_std = rf_predict_with_uncertainty(model, X)
             pred_ic50 = pic50_to_ic50_nM(pred_pic50)
 
-            # Similarity for AD (IMPORTANT: compute vs FULL dataset for stable scientific meaning)
+            # Applicability domain vs full dataset
             fps_all, idx_map_all = build_dataset_fps(df)
             sims_all = np.array(DataStructs.BulkTanimotoSimilarity(fp, fps_all), dtype=float) if len(fps_all) else np.array([])
             max_sim = float(sims_all.max()) if len(sims_all) else 0.0
@@ -309,7 +382,6 @@ with tab_pred:
                 st.warning(f"Borderline domain (max similarity: {max_sim:.3f})")
             else:
                 st.error(f"Out-of-domain risk (max similarity: {max_sim:.3f})")
-
             st.write(f"Mean similarity (dataset): {mean_sim:.3f}")
             conf = confidence_label(pred_std, max_sim)
             st.write("Confidence:", conf)
@@ -351,71 +423,56 @@ with tab_pred:
             for s in improvement_suggestions(d, max_sim):
                 st.write(f"- {s}")
 
-            with st.expander("How to interpret these metrics (quick guide)"):
-                st.markdown(
-                    """
-- **pIC50 / IC50:** potency prediction for CDK2. Higher pIC50 (lower IC50) is stronger inhibition.
-- **Uncertainty (σ):** consistency across RF trees (proxy for uncertainty). Lower is better.
-- **Similarity (Tanimoto):** how close your molecule is to training data. Low similarity ⇒ out-of-domain.
-- **MolWt, cLogP, TPSA, RotB, HBD/HBA:** common medicinal chemistry properties related to absorption/permeability.
-- **QED:** drug-likeness (higher is better).
-                    """
-                )
-
 with tab_val:
-    st.subheader("Nearest-neighbor evidence (auto-updates)")
-    st.write("This table always uses the current SMILES from the Predict tab.")
+    st.subheader("Nearest-neighbor evidence (updates with current SMILES)")
     smiles = st.session_state["smiles"]
     mol_q = mol_from_smiles(smiles)
+
+    use_filtered = st.toggle("Use filtered dataset for neighbors", value=False, help="Turn ON to restrict neighbor evidence to the filtered subset.")
+    df_nn = df_f if use_filtered else df
 
     if mol_q is None:
         st.error("Invalid SMILES.")
     else:
         fp_q = morgan_fp(mol_q)
-        fps_all, idx_map_all = build_dataset_fps(df)
-        sims = np.array(DataStructs.BulkTanimotoSimilarity(fp_q, fps_all), dtype=float)
+        fps_nn, idx_map_nn = build_dataset_fps(df_nn)
+        sims = np.array(DataStructs.BulkTanimotoSimilarity(fp_q, fps_nn), dtype=float) if len(fps_nn) else np.array([])
 
-        topk = 10
-        top = np.argsort(-sims)[:topk]
-        rows = []
-        for j in top:
-            row = df.iloc[int(idx_map_all[j])]
-            rows.append(
-                {
-                    "Tanimoto": float(sims[j]),
-                    "molecule_chembl_id": str(row.get("molecule_chembl_id", "")),
-                    "pic50(exp)": float(row.get("pic50", np.nan)),
-                    "ic50_nM(exp)": float(row.get("ic50_nM", np.nan)),
-                    "n_measurements": int(row.get("n_measurements", 0)),
-                    "smiles": str(row.get("smiles", "")),
-                }
-            )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if len(sims) == 0:
+            st.warning("No valid fingerprints found in selected neighbor set.")
+        else:
+            topk = 10
+            top = np.argsort(-sims)[:topk]
+            rows = []
+            for j in top:
+                row = df_nn.iloc[int(idx_map_nn[j])]
+                rows.append(
+                    {
+                        "Tanimoto": float(sims[j]),
+                        "molecule_chembl_id": str(row.get("molecule_chembl_id", "")),
+                        "pic50(exp)": float(row.get("pic50", np.nan)),
+                        "ic50_nM(exp)": float(row.get("ic50_nM", np.nan)),
+                        "n_measurements": int(row.get("n_measurements", 0)),
+                        "smiles": str(row.get("smiles", "")),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 with tab_data:
-    st.subheader("CDK2 dataset dashboard")
+    st.subheader("Dataset dashboard (full vs filtered)")
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total compounds", f"{len(df)}")
-    k2.metric("Mean pIC50", f"{df['pic50'].mean():.2f}")
-    k3.metric("Median pIC50", f"{df['pic50'].median():.2f}")
-    k4.metric("Strong binders (≥ 8)", f"{int((df['pic50'] >= 8.0).sum())}")
+    st.write("Full dataset vs filtered dataset distributions show what your filters are doing.")
 
     c1, c2 = st.columns(2)
     with c1:
-        fig = px.histogram(df, x="pic50", nbins=40, title="pIC50 distribution")
+        fig = px.histogram(df, x="pic50", nbins=40, title="pIC50 distribution (FULL)")
         st.plotly_chart(fig, use_container_width=True)
     with c2:
-        dfi = df.copy()
-        dfi["log10_ic50_nM"] = np.log10(dfi["ic50_nM"].clip(lower=1e-3))
-        fig2 = px.histogram(dfi, x="log10_ic50_nM", nbins=40, title="log10(IC50 nM) distribution")
-        st.plotly_chart(fig2, use_container_width=True)
+        figf = px.histogram(df_f, x="pic50", nbins=40, title="pIC50 distribution (FILTERED)")
+        st.plotly_chart(figf, use_container_width=True)
 
-    fig3 = px.histogram(df, x="n_measurements", nbins=30, title="n_measurements per compound")
+    fig3 = px.histogram(df, x="n_measurements", nbins=30, title="n_measurements (FULL)")
     st.plotly_chart(fig3, use_container_width=True)
-
-    st.markdown("### Preview")
-    st.dataframe(df.head(50), use_container_width=True)
 
 with tab_about:
     st.subheader("Methodology (scientific context)")
@@ -431,14 +488,10 @@ with tab_about:
 - Fingerprints: radius=2, 2048 bits  
 - Uncertainty proxy: std across RF trees
 
-**Applicability domain:**  
-- Uses Tanimoto similarity to dataset molecules.  
-- Low similarity indicates the model has limited training support for that chemistry.
+**Examples:**
+- Example molecules are selected from the CDK2 dataset itself (real target-relevant compounds).
 
-**Compound names:**  
-- If the molecule matches a dataset compound, we use its `molecule_chembl_id` and fetch `pref_name` from ChEMBL (when available).
-
-**ADMET-like properties in this app:**  
-- These are heuristics derived from physicochemical descriptors (not lab-measured ADMET).
+**Notes:**
+- Compound “name” may be missing for some ChEMBL IDs; in that case we display stable identifiers.
         """
     )
