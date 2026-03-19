@@ -1,9 +1,3 @@
-from pathlib import Path
-
-project = Path(r"C:\Users\utkar\chemblitz_project")
-(project / "README.md").write_text(
-"""# ChemBLitz — CDK2 pIC50 Scientific Predictor
-
 A scientific Streamlit web app to predict **CDK2 inhibitory potency (pIC50)** from **SMILES**, with validation and interpretability features.
 here is the link of cleaned data : -https://drive.google.com/file/d/1pOgZVHG7BfrcXE7ZmHJNM9CMnsBNlCQa/view?usp=drive_link
 ## What this app provides
@@ -29,6 +23,23 @@ here is the link of cleaned data : -https://drive.google.com/file/d/1pOgZVHG7Bfr
 - measurement count distribution (`n_measurements`)
 
 ---
+SMILES (input)
+   |
+   v
+RDKit validation + canonical SMILES + InChIKey
+   |
+   +--> Morgan fingerprint (2048 bits, radius=2) --> RandomForest --> Predicted pIC50 --> IC50(nM)
+   |
+   +--> PhysChem descriptors (MolWt, LogP, TPSA, HBD/HBA, RotB, Rings, QED) --> ADMET-like heuristics
+   |
+   +--> Tanimoto similarity vs dataset --> Applicability domain + top nearest neighbors
+
+Final output:
+- Predicted potency (pIC50 + IC50 nM)
+- Uncertainty proxy (std across RF trees)
+- Similarity validity + neighbors
+- PhysChem/ADMET heuristics + improvement suggestions
+```
 
 ## Methodology (high level)
 
