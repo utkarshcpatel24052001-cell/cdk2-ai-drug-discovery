@@ -7,5 +7,5 @@ pyarrow
 plotly
 requests
 pillow
-rdkit-pypi
 gdown
+rdkit-pypi
