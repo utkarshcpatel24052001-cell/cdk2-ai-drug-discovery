@@ -1,6 +1,10 @@
-{
- "cells": [],
- "metadata": {},
- "nbformat": 4,
- "nbformat_minor": 5
-}
+streamlit
+pandas
+numpy
+scikit-learn
+joblib
+pyarrow
+plotly
+requests
+pillow
+rdkit-pypi
