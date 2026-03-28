@@ -1,41 +1,64 @@
-A scientific Streamlit web app to predict **CDK2 inhibitory potency (pIC50)** from **SMILES**, with validation and interpretability features.
-here is the link of cleaned data : -https://drive.google.com/file/d/1pOgZVHG7BfrcXE7ZmHJNM9CMnsBNlCQa/view?usp=drive_link
-## What this app provides
+# ChemBLitz — CDK2 Pharmacological Diagnostic Suite
 
-### 1) Prediction (QSAR)
-- Input: **SMILES**
-- Output: **Predicted pIC50** (higher = stronger inhibition)
-- Also shows **Predicted IC50 (nM)** converted from pIC50
+Live App: https://cdk2-ai-drug-discovery-ffr8hm9thsadgagahfhjy6.streamlit.app/
 
-### 2) Scientific validation (important)
-- **Uncertainty proxy:** standard deviation across RandomForest trees  
-- **Applicability domain:** Tanimoto similarity to the training dataset  
-- **Nearest-neighbor evidence:** shows top similar dataset compounds and their experimental pIC50
-
-### 3) PhysChem + ADMET-like heuristics (rule-based)
-- RDKit descriptors: MolWt, cLogP, TPSA, HBD/HBA, Rotatable Bonds, Rings, QED
-- Lipinski Ro5 violations + Veber rule check
-- A final summary + improvement suggestions (e.g., reduce LogP, reduce flexibility, etc.)
-
-### 4) Dataset dashboard
-- pIC50 distribution
-- log10(IC50 nM) distribution
-- measurement count distribution (`n_measurements`)
+ChemBLitz is a professional decision-support dashboard for **CDK2 inhibitor discovery**. It combines a **pIC50 QSAR predictor** with **chemical asset validation** (applicability domain, nearest-neighbor evidence, PAINS alerts, scaffold context, and developability flags) to help prioritize compounds for synthesis and experimental testing.
 
 ---
-<img width="1024" height="559" alt="image" src="https://github.com/user-attachments/assets/6b6f35c7-1c2d-46e7-afe6-af97ab46fb37" />
 
-## Methodology (high level)
+## What this tool does
 
-- Features: **Morgan fingerprints** (radius=2, 2048 bits)
-- Model: **RandomForest regression**
-- Target: **CDK2** (Cyclin-dependent kinase 2)
-- Endpoint: IC50 → pIC50 conversion
+### 1) Precision QSAR prediction (CDK2)
+- Predicts **pIC50** (and converts to **IC50 nM**) for a query SMILES.
+- Reports an **uncertainty proxy (σ)** from tree-to-tree disagreement in the RandomForest model.
+
+### 2) Chemical asset validation (evidence + risk)
+- **Applicability Domain (AD):** Tanimoto similarity vs the evidence subset.
+- **Nearest-neighbor evidence:** Top-K similar compounds with experimental pIC50/IC50 (when available).
+- **PAINS screening:** flags common assay-interference motifs.
+- **Murcko scaffold context:** scaffold frequency + activity distribution + top exemplars.
+- **Developability flags:** Ro5/Veber-style heuristics + property risk indicators.
+
+### 3) Library triage (CSV)
+Real-world discovery work involves scoring libraries/series, not just single molecules.
+- Upload a CSV with a `smiles` column (optional `id`).
+- Exports a results table + **pass_triage** flags for fast prioritization.
+
+---
+
+## How to interpret results (quick guide)
+
+- **pIC50:** +1 pIC50 ≈ 10× stronger potency.
+- **IC50 (nM):** computed as `10^(9 - pIC50)`.
+- **σ (uncertainty):** model disagreement signal (not a calibrated confidence interval).
+- **Applicability Domain:** low similarity indicates extrapolation risk.
+  - max sim ≥ 0.50: in-domain  
+  - 0.30–0.50: borderline  
+  - < 0.30: out-of-domain risk  
 
 ---
 
 ## How to run locally
 
-### Install dependencies
+### Requirements
+- Python 3.x
+- RDKit available in your environment
+
+### Run
 ```bash
 pip install -r requirements.txt
+streamlit run app.py
+```
+
+---
+
+## Repository structure
+- `app.py` — Streamlit dashboard
+- `cdk2_pic50_clean.parquet` — curated CDK2 dataset used for evidence + validation
+- `cdk2_rf_final_all_data.joblib` — trained RandomForest model (downloaded/loaded by the app)
+- `requirements.txt` — dependencies
+
+---
+
+## Disclaimer
+This is a **research decision-support tool** intended for hypothesis generation and prioritization. Predictions require experimental validation and are not intended for clinical or safety-critical decisions.
