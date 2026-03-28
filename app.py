@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Tuple
@@ -24,6 +25,7 @@ st.set_page_config(page_title="ChemBLitz — CDK2 Scientific Predictor", layout=
 PROJECT = Path(__file__).resolve().parent
 DATA_PATH = PROJECT / "cdk2_pic50_clean.parquet"
 MODEL_PATH = PROJECT / "cdk2_rf_final_all_data.joblib"
+MODEL_DRIVE_FILE_ID = "1pOgZVHG7BfrcXE7ZmHJNM9CMnsBNlCQa"
 
 FP_RADIUS = 2
 FP_NBITS = 2048
@@ -31,17 +33,49 @@ SIM_HIGH = 0.50
 SIM_MED = 0.30
 
 # =========================
-# 3. CRITICAL FILE CHECKS
+# 3. DOWNLOAD HANDLER & FILE CHECKS
 # =========================
+def download_model_from_drive(file_id: str, destination: Path) -> None:
+    session = requests.Session()
+    url = "https://drive.google.com/uc?export=download"
+    params = {"id": file_id}
+    
+    resp = session.get(url, params=params, stream=True, timeout=60)
+    
+    # Handle Google's virus scan warning for large files
+    token = None
+    for k, v in resp.cookies.items():
+        if k.startswith("download_warning"):
+            token = v
+            break
+    if not token:
+        m = re.search(r"confirm=([0-9A-Za-z_]+)", resp.text)
+        if m:
+            token = m.group(1)
+            
+    if token:
+        params["confirm"] = token
+        resp = session.get(url, params=params, stream=True, timeout=60)
+        
+    resp.raise_for_status()
+    
+    with open(destination, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
 if not DATA_PATH.exists():
     st.error(f"❌ Dataset not found: {DATA_PATH}")
-    st.info("Please upload 'cdk2_pic50_clean.parquet' to the Space root.")
     st.stop()
 
 if not MODEL_PATH.exists():
-    st.error(f"❌ Model file not found: {MODEL_PATH}")
-    st.info("Please upload 'cdk2_rf_final_all_data.joblib' to the Space root.")
-    st.stop()
+    with st.spinner("Downloading 142MB model from Google Drive (this takes ~15 seconds on first boot)..."):
+        try:
+            download_model_from_drive(MODEL_DRIVE_FILE_ID, MODEL_PATH)
+            st.success("Model downloaded successfully!")
+        except Exception as e:
+            st.error(f"Failed to download model from Google Drive: {e}")
+            st.stop()
 
 # =========================
 # 4. HELPERS
@@ -51,8 +85,7 @@ def pic50_to_ic50_nM(pic50: float) -> float:
 
 def mol_from_smiles(smiles: str) -> Optional[Chem.Mol]:
     mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
+    if mol is None: return None
     Chem.SanitizeMol(mol)
     return mol
 
@@ -60,10 +93,8 @@ def canonical_smiles(mol: Chem.Mol) -> str:
     return Chem.MolToSmiles(mol, canonical=True)
 
 def inchikey(mol: Chem.Mol) -> str:
-    try:
-        return Chem.inchi.MolToInchiKey(mol)
-    except Exception:
-        return "N/A"
+    try: return Chem.inchi.MolToInchiKey(mol)
+    except Exception: return "N/A"
 
 def morgan_fp(mol: Chem.Mol, radius: int = FP_RADIUS, n_bits: int = FP_NBITS):
     return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
@@ -81,23 +112,14 @@ def draw_mol_png(mol: Chem.Mol, size=(440, 300)) -> bytes:
 
 def compute_descriptors(mol: Chem.Mol) -> dict:
     return {
-        "MolWt": float(Descriptors.MolWt(mol)),
-        "LogP": float(Descriptors.MolLogP(mol)),
-        "TPSA": float(rdMolDescriptors.CalcTPSA(mol)),
-        "HBD": int(rdMolDescriptors.CalcNumHBD(mol)),
-        "HBA": int(rdMolDescriptors.CalcNumHBA(mol)),
-        "RotB": int(rdMolDescriptors.CalcNumRotatableBonds(mol)),
-        "Rings": int(rdMolDescriptors.CalcNumRings(mol)),
-        "QED": float(QED.qed(mol)),
+        "MolWt": float(Descriptors.MolWt(mol)), "LogP": float(Descriptors.MolLogP(mol)),
+        "TPSA": float(rdMolDescriptors.CalcTPSA(mol)), "HBD": int(rdMolDescriptors.CalcNumHBD(mol)),
+        "HBA": int(rdMolDescriptors.CalcNumHBA(mol)), "RotB": int(rdMolDescriptors.CalcNumRotatableBonds(mol)),
+        "Rings": int(rdMolDescriptors.CalcNumRings(mol)), "QED": float(QED.qed(mol)),
     }
 
 def lipinski_violations(d: dict) -> int:
-    v = 0
-    if d["MolWt"] > 500: v += 1
-    if d["LogP"] > 5: v += 1
-    if d["HBD"] > 5: v += 1
-    if d["HBA"] > 10: v += 1
-    return v
+    return sum([d["MolWt"] > 500, d["LogP"] > 5, d["HBD"] > 5, d["HBA"] > 10])
 
 def veber_pass(d: dict) -> bool:
     return (d["TPSA"] <= 140.0) and (d["RotB"] <= 10)
@@ -125,12 +147,9 @@ def improvement_suggestions(d: dict, max_sim: float) -> list[str]:
 @st.cache_data(show_spinner=False)
 def chembl_pref_name_from_chembl_id(chembl_id: str) -> Optional[str]:
     try:
-        url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{chembl_id}.json"
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200: return None
-        return str(r.json().get("pref_name", "")) or None
-    except Exception:
-        return None
+        r = requests.get(f"https://www.ebi.ac.uk/chembl/api/data/molecule/{chembl_id}.json", timeout=10)
+        return str(r.json().get("pref_name", "")) or None if r.status_code == 200 else None
+    except Exception: return None
 
 # =========================
 # 5. DATA & MODEL LOADING
@@ -185,7 +204,7 @@ def get_df_and_examples():
 # 6. USER INTERFACE
 # =========================
 st.title("ChemBLitz — CDK2 pIC50 Scientific Predictor")
-st.caption("CDK2-only. RandomForest on Morgan fingerprints. Model and data stored locally.")
+st.caption("CDK2-only. RandomForest on Morgan fingerprints. Model dynamically loaded.")
 
 df, examples = get_df_and_examples()
 
@@ -199,8 +218,7 @@ with tab_pred:
     with c_left:
         st.subheader("Input")
         ex = st.selectbox("Load CDK2 dataset example", list(examples.keys()), index=0)
-        if st.button("Use selected example"):
-            st.session_state["smiles"] = examples[ex]
+        if st.button("Use selected example"): st.session_state["smiles"] = examples[ex]
         st.session_state["smiles"] = st.text_input("SMILES", value=st.session_state["smiles"])
         run = st.button("Predict", type="primary")
 
@@ -222,7 +240,7 @@ with tab_pred:
                 st.error("Invalid SMILES.")
                 st.stop()
             
-            with st.spinner("Loading model…"):
+            with st.spinner("Loading model into memory…"):
                 model = load_model()
             
             st.image(draw_mol_png(mol), caption="Input structure (RDKit 2D)")
