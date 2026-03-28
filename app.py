@@ -17,7 +17,7 @@ from rdkit.Chem import AllChem, Descriptors, Draw, QED, rdMolDescriptors
 # =========================
 # 1. STREAMLIT CONFIG
 # =========================
-st.set_page_config(page_title="ChemBLitz — CDK2 Predictor", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="ChemBLitz — CDK2 Predictor", layout="wide")
 
 # =========================
 # 2. PATHS & CONSTANTS
@@ -43,7 +43,7 @@ if not DATA_PATH.exists():
     st.stop()
 
 if not MODEL_PATH.exists():
-    with st.spinner("Downloading 142MB Model from secure storage (First boot only)..."):
+    with st.spinner("Downloading Scientific Model (First boot only)..."):
         try:
             download_model_from_drive(MODEL_DRIVE_FILE_ID, MODEL_PATH)
         except Exception as e:
@@ -62,12 +62,11 @@ def mol_from_smiles(smiles: str) -> Optional[Chem.Mol]:
     Chem.SanitizeMol(mol)
     return mol
 
-def canonical_smiles(mol: Chem.Mol) -> str:
-    return Chem.MolToSmiles(mol, canonical=True)
-
-def inchikey(mol: Chem.Mol) -> str:
-    try: return Chem.inchi.MolToInchiKey(mol)
-    except Exception: return "N/A"
+def draw_mol_png(mol: Chem.Mol, size=(400, 250)) -> bytes:
+    img = Draw.MolToImage(mol, size=size)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 def morgan_fp(mol: Chem.Mol, radius: int = FP_RADIUS, n_bits: int = FP_NBITS):
     return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
@@ -77,12 +76,6 @@ def fp_to_numpy(fp, n_bits: int = FP_NBITS) -> np.ndarray:
     DataStructs.ConvertToNumpyArray(fp, arr)
     return arr
 
-def draw_mol_png(mol: Chem.Mol, size=(400, 250)) -> bytes:
-    img = Draw.MolToImage(mol, size=size)
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
 def compute_descriptors(mol: Chem.Mol) -> dict:
     return {
         "MolWt": float(Descriptors.MolWt(mol)), "LogP": float(Descriptors.MolLogP(mol)),
@@ -91,30 +84,18 @@ def compute_descriptors(mol: Chem.Mol) -> dict:
         "Rings": int(rdMolDescriptors.CalcNumRings(mol)), "QED": float(QED.qed(mol)),
     }
 
-def lipinski_violations(d: dict) -> int:
-    return sum([d["MolWt"] > 500, d["LogP"] > 5, d["HBD"] > 5, d["HBA"] > 10])
-
-def veber_pass(d: dict) -> bool:
-    return (d["TPSA"] <= 140.0) and (d["RotB"] <= 10)
-
 def potency_bucket(pic50: float) -> str:
     if pic50 >= 8.0: return "Strong (≥ 8.0)"
     if pic50 >= 6.0: return "Moderate (6.0 - 8.0)"
     return "Weak (< 6.0)"
 
-def confidence_label(pred_std: float, max_sim: float) -> str:
-    if (max_sim >= SIM_HIGH) and (pred_std <= 0.35): return "High"
-    if (max_sim >= SIM_MED) and (pred_std <= 0.60): return "Medium"
-    return "Low"
-
 def improvement_suggestions(d: dict, max_sim: float) -> list[str]:
     s = []
-    if d["LogP"] > 4.5: s.append("LogP is high: Consider adding polarity (HBA/HBD) or removing hydrophobic groups.")
-    if d["TPSA"] > 140: s.append("TPSA is high: May reduce cell permeability. Consider masking polar groups.")
-    if d["RotB"] > 10: s.append("High flexibility: Reduce rotatable bonds via rigidification to improve binding entropy.")
-    if d["MolWt"] > 500: s.append("MolWt > 500: Consider scaffold simplification to maintain drug-likeness.")
-    if max_sim < SIM_MED: s.append("Out-of-Domain Risk: Low similarity to known CDK2 data. Treat prediction with caution.")
-    if not s: s.append("No major ADMET red flags detected. Next focus on kinase selectivity and metabolic stability.")
+    if d["LogP"] > 4.5: s.append("LogP high: Consider adding polar groups.")
+    if d["TPSA"] > 140: s.append("TPSA high: Potential permeability issues.")
+    if d["RotB"] > 10: s.append("High flexibility: Consider rigidification.")
+    if max_sim < SIM_MED: s.append("Low similarity to training data: Use caution.")
+    if not s: s.append("No major red flags detected.")
     return s
 
 # =========================
@@ -144,143 +125,88 @@ def rf_predict_with_uncertainty(model, X: np.ndarray) -> Tuple[float, float]:
 
 def build_real_examples_from_dataset(df: pd.DataFrame) -> dict[str, str]:
     out: dict[str, str] = {}
-    dff = df.dropna(subset=["pic50", "smiles"]).copy()
-    
-    top = dff.sort_values("pic50", ascending=False).head(1)
-    if len(top): out[f"Strong Binder (pIC50 {top.iloc[0]['pic50']:.2f})"] = str(top.iloc[0]["smiles"])
-    
-    med_pic = float(dff["pic50"].median())
-    med_row = dff.iloc[(dff["pic50"] - med_pic).abs().argsort()[:1]]
-    if len(med_row): out[f"Moderate Binder (pIC50 ~{med_pic:.2f})"] = str(med_row.iloc[0]["smiles"])
-    
-    low = dff.sort_values("pic50", ascending=True).head(1)
-    if len(low): out[f"Weak Binder (pIC50 {low.iloc[0]['pic50']:.2f})"] = str(low.iloc[0]["smiles"])
-    
+    dff = df.dropna(subset=["pic50", "smiles"]).sort_values("pic50", ascending=False)
+    if not dff.empty:
+        out[f"Strong Binder (pIC50 {dff.iloc[0]['pic50']:.2f})"] = str(dff.iloc[0]["smiles"])
+        mid = len(dff)//2
+        out[f"Moderate Binder (pIC50 {dff.iloc[mid]['pic50']:.2f})"] = str(dff.iloc[mid]["smiles"])
     return out
 
 # =========================
-# 6. USER INTERFACE
+# 6. UI
 # =========================
-st.title("🧬 ChemBLitz: CDK2 pIC50 Scientific Predictor")
-st.markdown("A professional cheminformatics pipeline for predicting Cyclin-dependent kinase 2 (CDK2) inhibition, integrating RandomForest modeling, Applicability Domain assessment, and ADMET heuristics.")
+st.title("🧬 ChemBLitz: CDK2 pIC50 Predictor")
 
 df = load_data()
 examples = build_real_examples_from_dataset(df)
 
 if "smiles" not in st.session_state:
-    st.session_state["smiles"] = examples.get(list(examples.keys())[0], "CCO")
+    st.session_state["smiles"] = list(examples.values())[0]
 
-tab_pred, tab_val, tab_data, tab_about = st.tabs(["Target Prediction", "Nearest Neighbors", "Dataset Dashboard", "Methodology"])
+tab_pred, tab_val, tab_data, tab_about = st.tabs(["Prediction", "Nearest Neighbors", "Dashboard", "Methodology"])
 
 with tab_pred:
-    c_left, c_right = st.columns([1.0, 1.2], gap="large")
+    col_input, col_output = st.columns([1, 1.2], gap="large")
     
-    with c_left:
+    with col_input:
         st.subheader("Query Setup")
-        
-        # Example Loader
-        ex = st.selectbox("Load known CDK2 ligand:", list(examples.keys()), index=0)
-        if st.button("Use selected example", use_container_width=True):
+        ex = st.selectbox("Load Dataset Example:", list(examples.keys()))
+        if st.button("Use Example", use_container_width=True):
             st.session_state["smiles"] = examples[ex]
             
-        st.session_state["smiles"] = st.text_input("Enter SMILES string:", value=st.session_state["smiles"])
-        
+        st.session_state["smiles"] = st.text_input("SMILES String:", value=st.session_state["smiles"])
         run = st.button("Predict Potency", type="primary", use_container_width=True)
 
-        st.markdown("<br><hr>", unsafe_allow_html=True)
+        st.markdown("---")
         st.subheader("Dataset Filters")
-        st.caption("These filters control the Nearest Neighbors and Dashboard tabs.")
-        
-        pic50_min, pic50_max = float(df["pic50"].min()), float(df["pic50"].max())
-        pic50_range = st.slider("pIC50 Threshold", pic50_min, pic50_max, (pic50_min, pic50_max))
-        min_n = st.slider("Minimum assay measurements", 1, int(df["n_measurements"].max()), 1)
-        
-        df_f = df[(df["pic50"] >= pic50_range[0]) & (df["pic50"] <= pic50_range[1]) & (df["n_measurements"] >= min_n)]
-        st.info(f"Filtered compounds available: {len(df_f)} / {len(df)}")
+        p_min, p_max = float(df["pic50"].min()), float(df["pic50"].max())
+        p_range = st.slider("pIC50 Threshold", p_min, p_max, (p_min, p_max))
+        min_n = st.slider("Min measurements", 1, int(df["n_measurements"].max()), 1)
+        df_f = df[(df["pic50"] >= p_range[0]) & (df["pic50"] <= p_range[1]) & (df["n_measurements"] >= min_n)]
 
-    with c_right:
-        if not run:
-            st.info("👈 Enter a SMILES string and click **Predict Potency** to generate a comprehensive molecular report.")
-        else:
+    with col_output:
+        if run:
             mol = mol_from_smiles(st.session_state["smiles"])
-            if mol is None:
-                st.error("Invalid SMILES structure. Please verify your input.")
-                st.stop()
-            
-            with st.spinner("Executing RandomForest Model..."):
+            if mol:
                 model = load_model()
                 fp = morgan_fp(mol)
                 X = fp_to_numpy(fp).reshape(1, -1)
-                pred_pic50, pred_std = rf_predict_with_uncertainty(model, X)
+                p_val, p_std = rf_predict_with_uncertainty(model, X)
                 
-                fps_all, _ = build_dataset_fps(df)
-                sims_all = np.array(DataStructs.BulkTanimotoSimilarity(fp, fps_all), dtype=float) if len(fps_all) else np.array([])
-                max_sim = float(sims_all.max()) if len(sims_all) else 0.0
-
-            # --- CARD 1: Prediction Overview ---
-            with st.container(border=True):
-                colA, colB = st.columns([1, 2])
-                with colA:
-                    st.image(draw_mol_png(mol), use_container_width=True)
-                with colB:
-                    st.markdown("### Primary Prediction")
-                    m1, m2 = st.columns(2)
-                    m1.metric("Predicted pIC50", f"{pred_pic50:.3f}", help="Higher is more potent")
-                    m2.metric("Predicted IC50 (nM)", f"{pic50_to_ic50_nM(pred_pic50):,.1f}", help="Lower is more potent")
-                    
-                    st.markdown(f"**Classification:** `{potency_bucket(pred_pic50)}`")
-                    
-                    # Fix: Match by exact string to prevent InChIKey hashing failures
-                    local_match = df[df["smiles"] == st.session_state["smiles"]]
-                    if local_match.empty and "inchikey" in df.columns:
-                        local_match = df[df["inchikey"].astype(str) == inchikey(mol)]
-                        
-                    chembl_id = str(local_match.iloc[0].get("molecule_chembl_id", "")).strip() if len(local_match) > 0 else None
-                    if chembl_id:
-                        st.success(f"Verified Training Compound: **{chembl_id}**")
-                    else:
-                        st.caption("Compound not found in the training dataset (Novel).")
-
-            # --- CARD 2: Confidence & Domain ---
-            with st.container(border=True):
-                st.markdown("### Applicability Domain & Confidence")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Model Uncertainty (σ)", f"{pred_std:.3f}")
-                c2.metric("Max Tanimoto Sim.", f"{max_sim:.3f}")
-                c3.metric("Overall Confidence", confidence_label(pred_std, max_sim))
+                with st.container(border=True):
+                    st.markdown("### Prediction Results")
+                    c1, c2 = st.columns([1, 2])
+                    c1.image(draw_mol_png(mol))
+                    c2.metric("Predicted pIC50", f"{p_val:.3f}")
+                    c2.metric("Predicted IC50 (nM)", f"{pic50_to_ic50_nM(p_val):,.1f}")
+                    c2.write(f"**Classification:** {potency_bucket(p_val)}")
                 
-                if max_sim >= SIM_HIGH: 
-                    st.success("High structural overlap with training data. Prediction is reliable.")
-                elif max_sim >= SIM_MED: 
-                    st.warning("Moderate structural overlap. Borderline applicability domain.")
-                else: 
-                    st.error("Low structural overlap (Novel Chemotype). Treat prediction with high caution.")
-
-            # --- CARD 3: ADMET Profile ---
-            with st.container(border=True):
-                st.markdown("### Lead-Likeness & ADMET Profile")
-                d = compute_descriptors(mol)
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Mol. Weight", f"{d['MolWt']:.1f}")
-                d2.metric("cLogP", f"{d['LogP']:.2f}")
-                d3.metric("TPSA", f"{d['TPSA']:.1f}")
-                d4.metric("QED Score", f"{d['QED']:.2f}")
-
-                ro5 = lipinski_violations(d)
-                vp = "Pass" if veber_pass(d) else "Fail"
-                st.markdown(f"**Lipinski Violations:** `{ro5}` | **Veber Rule:** `{vp}`")
-                
-                with st.expander("View MedChem Improvement Suggestions"):
-                    for s in improvement_suggestions(d, max_sim):
+                with st.container(border=True):
+                    st.markdown("### ADMET & Suggestions")
+                    d = compute_descriptors(mol)
+                    st.write(f"**MolWt:** {d['MolWt']:.1f} | **LogP:** {d['LogP']:.2f} | **QED:** {d['QED']:.2f}")
+                    for s in improvement_suggestions(d, 0.5):
                         st.markdown(f"- {s}")
+            else:
+                st.error("Invalid SMILES.")
+        else:
+            st.info("Enter SMILES and click Predict.")
 
 with tab_val:
     st.subheader("Nearest Neighbors Analysis")
-    st.caption("Identifies the most structurally similar compounds based on your Dataset Filters.")
-    mol_q = mol_from_smiles(st.session_state.get("smiles", "CCO"))
-    if mol_q and st.button("Compute Structural Neighbors", type="primary"):
-        with st.spinner("Querying dataset..."):
+    if st.button("Compute Neighbors", type="primary"):
+        mol_q = mol_from_smiles(st.session_state["smiles"])
+        if mol_q:
             fp_q = morgan_fp(mol_q)
             fps_nn, idx_map = build_dataset_fps(df_f)
-            
-            if len(fps_nn) >
+            # FIX: Added the missing 0 for the comparison
+            if len(fps_nn) > 0:
+                sims = np.array(DataStructs.BulkTanimotoSimilarity(fp_q, fps_nn))
+                top = np.argsort(-sims)[:10]
+                rows = [{"Similarity": f"{sims[j]:.3f}", "Exp. pIC50": df_f.iloc[idx_map[j]]["pic50"]} for j in top]
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+with tab_data:
+    st.subheader("Dataset Dashboard")
+    if not df_f.empty:
+        st.plotly_chart(px.histogram(df_f, x="pic50", title="pIC50 Distribution"), use_container_width=True)
