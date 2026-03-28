@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional, Tuple
 
+import gdown
 import joblib
 import numpy as np
 import pandas as pd
@@ -36,36 +37,12 @@ SIM_MED = 0.30
 # 3. DOWNLOAD HANDLER & FILE CHECKS
 # =========================
 def download_model_from_drive(file_id: str, destination: Path) -> None:
-    session = requests.Session()
-    url = "https://drive.google.com/uc?export=download"
-    params = {"id": file_id}
-    
-    resp = session.get(url, params=params, stream=True, timeout=60)
-    
-    # Handle Google's virus scan warning for large files
-    token = None
-    for k, v in resp.cookies.items():
-        if k.startswith("download_warning"):
-            token = v
-            break
-    if not token:
-        m = re.search(r"confirm=([0-9A-Za-z_]+)", resp.text)
-        if m:
-            token = m.group(1)
-            
-    if token:
-        params["confirm"] = token
-        resp = session.get(url, params=params, stream=True, timeout=60)
-        
-    resp.raise_for_status()
-    
-    with open(destination, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
+    # gdown automatically bypasses Google Drive's large-file virus scan warnings
+    gdown.download(id=file_id, output=str(destination), quiet=False)
 
 if not DATA_PATH.exists():
     st.error(f"❌ Dataset not found: {DATA_PATH}")
+    st.info("Please ensure 'cdk2_pic50_clean.parquet' is pushed to your GitHub repository.")
     st.stop()
 
 if not MODEL_PATH.exists():
