@@ -1,3 +1,16 @@
+---
+title: CDK2 AI Drug Discovery
+emoji: 🧬
+colorFrom: blue
+colorTo: green
+sdk: streamlit
+sdk_version: 1.55.0
+app_file: app.py
+pinned: false
+---
+
+# CDK2 AI Drug Discovery
+
 A scientific Streamlit web app to predict **CDK2 inhibitory potency (pIC50)** from **SMILES**, with validation and interpretability features.
 here is the link of cleaned data : -https://drive.google.com/file/d/1pOgZVHG7BfrcXE7ZmHJNM9CMnsBNlCQa/view?usp=drive_link
 ## What this app provides

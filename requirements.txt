@@ -8,4 +8,4 @@ plotly==6.0.0
 requests==2.32.3
 pillow==11.1.0
 huggingface_hub==0.30.0
-rdkit==2023.9.6
+rdkit-pypi==2022.9.5

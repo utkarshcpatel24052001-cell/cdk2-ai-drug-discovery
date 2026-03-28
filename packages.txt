@@ -1,0 +1,4 @@
+libxrender1
+libgomp1
+libsm6
+libxext6
