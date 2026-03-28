@@ -8,3 +8,4 @@ plotly
 requests
 pillow
 rdkit
+gdown
