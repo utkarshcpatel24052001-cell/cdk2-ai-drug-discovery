@@ -16,7 +16,7 @@ from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem, Descriptors, Draw, QED, rdMolDescriptors
 
 # =========================
-# 1. STREAMLIT CONFIG (MUST BE FIRST)
+# 1. STREAMLIT CONFIG
 # =========================
 st.set_page_config(page_title="ChemBLitz — CDK2 Scientific Predictor", layout="wide")
 
@@ -34,15 +34,13 @@ SIM_HIGH = 0.50
 SIM_MED = 0.30
 
 # =========================
-# 3. DOWNLOAD HANDLER & FILE CHECKS
+# 3. DOWNLOAD HANDLER
 # =========================
 def download_model_from_drive(file_id: str, destination: Path) -> None:
-    # gdown automatically bypasses Google Drive's large-file virus scan warnings
     gdown.download(id=file_id, output=str(destination), quiet=False)
 
 if not DATA_PATH.exists():
     st.error(f"❌ Dataset not found: {DATA_PATH}")
-    st.info("Please ensure 'cdk2_pic50_clean.parquet' is pushed to your GitHub repository.")
     st.stop()
 
 if not MODEL_PATH.exists():
@@ -51,7 +49,7 @@ if not MODEL_PATH.exists():
             download_model_from_drive(MODEL_DRIVE_FILE_ID, MODEL_PATH)
             st.success("Model downloaded successfully!")
         except Exception as e:
-            st.error(f"Failed to download model from Google Drive: {e}")
+            st.error(f"Failed to download model: {e}")
             st.stop()
 
 # =========================
@@ -154,10 +152,9 @@ def rf_predict_with_uncertainty(model, X: np.ndarray) -> Tuple[float, float]:
     return float(preds.mean()), float(preds.std(ddof=1))
 
 def build_real_examples_from_dataset(df: pd.DataFrame) -> dict[str, str]:
+    if df.empty: return {"No matching examples": "CCO"}
     out: dict[str, str] = {}
     dff = df.dropna(subset=["pic50", "smiles"]).copy()
-    dff["pic50"] = pd.to_numeric(dff["pic50"], errors="coerce")
-    dff = dff.dropna(subset=["pic50"])
     
     top = dff.sort_values("pic50", ascending=False).head(1)
     if len(top): out[f"Top binder (pIC50 {top.iloc[0]['pic50']:.2f})"] = str(top.iloc[0]["smiles"])
@@ -172,58 +169,58 @@ def build_real_examples_from_dataset(df: pd.DataFrame) -> dict[str, str]:
     if not out: out["Dataset example"] = str(df.iloc[0]["smiles"])
     return out
 
-@st.cache_resource
-def get_df_and_examples():
-    df_local = load_data()
-    return df_local, build_real_examples_from_dataset(df_local)
-
 # =========================
 # 6. USER INTERFACE
 # =========================
+df = load_data()
+
+# GLOBAL SIDEBAR FILTERS (Interconnects everything)
+st.sidebar.header("Global Dataset Filters")
+st.sidebar.caption("Adjusting these instantly updates the examples, dashboard, and neighbors.")
+pic50_min, pic50_max = float(df["pic50"].min()), float(df["pic50"].max())
+pic50_range = st.sidebar.slider("pIC50 range", pic50_min, pic50_max, (pic50_min, pic50_max))
+min_n = st.sidebar.slider("Min measurements", 1, int(df["n_measurements"].max()), 1)
+
+# Apply filter to create the working dataframe
+df_f = df[(df["pic50"] >= pic50_range[0]) & (df["pic50"] <= pic50_range[1]) & (df["n_measurements"] >= min_n)]
+examples = build_real_examples_from_dataset(df_f)
+
 st.title("ChemBLitz — CDK2 pIC50 Scientific Predictor")
-st.caption("CDK2-only. RandomForest on Morgan fingerprints. Model dynamically loaded.")
+st.caption("CDK2-only. RandomForest on Morgan fingerprints. Fully reactive interface.")
 
-df, examples = get_df_and_examples()
+# Handle State for connected inputs
+if "last_ex" not in st.session_state: st.session_state.last_ex = list(examples.keys())[0]
 
-if "smiles" not in st.session_state:
-    st.session_state["smiles"] = str(df.iloc[0]["smiles"]) if "smiles" in df.columns else "CCO"
-
-tab_pred, tab_val, tab_data, tab_about = st.tabs(["Predict", "Validate (Similarity)", "Dataset Dashboard", "Methodology"])
+tab_pred, tab_val, tab_data, tab_about = st.tabs(["Predict", "Validate (Nearest Neighbors)", "Dataset Dashboard", "Methodology"])
 
 with tab_pred:
     c_left, c_right = st.columns([1.05, 0.95], gap="large")
     with c_left:
         st.subheader("Input")
-        ex = st.selectbox("Load CDK2 dataset example", list(examples.keys()), index=0)
-        if st.button("Use selected example"): st.session_state["smiles"] = examples[ex]
-        st.session_state["smiles"] = st.text_input("SMILES", value=st.session_state["smiles"])
-        run = st.button("Predict", type="primary")
-
-        st.markdown("---")
-        st.subheader("Dataset filters")
-        pic50_min, pic50_max = float(df["pic50"].min()), float(df["pic50"].max())
-        pic50_range = st.slider("pIC50 range", pic50_min, pic50_max, (pic50_min, pic50_max))
-        min_n = st.slider("Min measurements", 1, int(df["n_measurements"].max()), 1)
-        df_f = df[(df["pic50"] >= pic50_range[0]) & (df["pic50"] <= pic50_range[1]) & (df["n_measurements"] >= min_n)]
-        st.info(f"Filtered dataset size: {len(df_f)} / {len(df)}")
+        
+        # Selectbox instantly updates SMILES
+        ex = st.selectbox("Load filtered CDK2 dataset example", list(examples.keys()), index=0)
+        if ex != st.session_state.last_ex:
+            st.session_state.smiles_input = examples[ex]
+            st.session_state.last_ex = ex
+            
+        smiles = st.text_input("SMILES", value=examples[ex], key="smiles_input")
 
     with c_right:
         st.subheader("Output")
-        if not run:
-            st.info("Click **Predict** to generate outputs.")
+        mol = mol_from_smiles(smiles)
+        if mol is None:
+            st.error("Invalid SMILES. Please enter a valid structure.")
         else:
-            mol = mol_from_smiles(st.session_state["smiles"])
-            if mol is None:
-                st.error("Invalid SMILES.")
-                st.stop()
-            
-            with st.spinner("Loading model into memory…"):
-                model = load_model()
-            
+            # 100% Reactive - No "Predict" button needed
+            model = load_model()
             st.image(draw_mol_png(mol), caption="Input structure (RDKit 2D)")
             
-            ik = inchikey(mol)
-            local_match = df[df["inchikey"].astype(str) == ik] if "inchikey" in df.columns else pd.DataFrame()
+            # FIX: Match by exact SMILES string first to avoid InChIKey hashing bugs
+            local_match = df[df["smiles"] == smiles]
+            if local_match.empty and "inchikey" in df.columns:
+                local_match = df[df["inchikey"].astype(str) == inchikey(mol)]
+                
             chembl_id = str(local_match.iloc[0].get("molecule_chembl_id", "")).strip() if len(local_match) > 0 else None
             
             if chembl_id: st.success(f"Found in dataset: {chembl_id}")
@@ -240,13 +237,13 @@ with tab_pred:
             m4.metric("Potency class", potency_bucket(pred_pic50))
 
             st.markdown("### Applicability domain")
-            if st.button("Compute similarity", key="sim_button"):
-                with st.spinner("Computing dataset similarity…"):
-                    fps_all, _ = build_dataset_fps(df)
-                    sims_all = np.array(DataStructs.BulkTanimotoSimilarity(fp, fps_all), dtype=float) if len(fps_all) else np.array([])
-                    max_sim = float(sims_all.max()) if len(sims_all) else 0.0
-                    if max_sim >= SIM_HIGH: st.success(f"In-domain (similarity: {max_sim:.3f})")
-                    else: st.warning(f"Borderline/Out-of-domain (similarity: {max_sim:.3f})")
+            # Automatically computes similarity in milliseconds
+            fps_all, _ = build_dataset_fps(df)
+            sims_all = np.array(DataStructs.BulkTanimotoSimilarity(fp, fps_all), dtype=float) if len(fps_all) else np.array([])
+            max_sim = float(sims_all.max()) if len(sims_all) else 0.0
+            
+            if max_sim >= SIM_HIGH: st.success(f"In-domain (similarity: {max_sim:.3f})")
+            else: st.warning(f"Borderline/Out-of-domain (similarity: {max_sim:.3f})")
 
             st.markdown("### PhysChem & ADMET")
             d = compute_descriptors(mol)
@@ -256,34 +253,33 @@ with tab_pred:
             d3.metric("TPSA", f"{d['TPSA']:.1f}")
             d4.metric("QED", f"{d['QED']:.2f}")
 
-            for s in improvement_suggestions(d, 0.0):
+            for s in improvement_suggestions(d, max_sim):
                 st.write(f"- {s}")
 
 with tab_val:
-    st.subheader("Nearest Neighbors")
-    mol_q = mol_from_smiles(st.session_state["smiles"])
-    if mol_q and st.button("Compute nearest neighbors", type="primary"):
-        with st.spinner("Computing similarity…"):
-            fp_q = morgan_fp(mol_q)
-            fps_nn, idx_map = build_dataset_fps(df)
+    st.subheader("Nearest Neighbors (From Filtered Dataset)")
+    mol_q = mol_from_smiles(smiles)
+    if mol_q:
+        fp_q = morgan_fp(mol_q)
+        fps_nn, idx_map = build_dataset_fps(df_f) # Uses filtered df automatically
+        if len(fps_nn) > 0:
             sims = np.array(DataStructs.BulkTanimotoSimilarity(fp_q, fps_nn), dtype=float)
             top = np.argsort(-sims)[:10]
             
-            rows = []
-            for j in top:
-                row = df.iloc[int(idx_map[j])]
-                rows.append({
-                    "Tanimoto": float(sims[j]),
-                    "pic50": float(row.get("pic50", np.nan)),
-                    "smiles": str(row.get("smiles", ""))
-                })
+            rows = [{"Tanimoto Similarity": float(sims[j]), "pIC50 (Exp)": float(df_f.iloc[int(idx_map[j])].get("pic50", np.nan)), "SMILES": str(df_f.iloc[int(idx_map[j])].get("smiles", ""))} for j in top]
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        else:
+            st.info("No neighbors match the current global filters.")
 
 with tab_data:
-    st.subheader("Dataset Dashboard")
-    c1, c2 = st.columns(2)
-    with c1: st.plotly_chart(px.histogram(df, x="pic50", title="pIC50 Distribution"), use_container_width=True)
-    with c2: st.plotly_chart(px.histogram(df, x="n_measurements", title="Measurement Counts"), use_container_width=True)
+    st.subheader("Filtered Dataset Dashboard")
+    if not df_f.empty:
+        c1, c2 = st.columns(2)
+        with c1: st.plotly_chart(px.histogram(df_f, x="pic50", title="Filtered pIC50 Distribution"), use_container_width=True)
+        with c2: st.plotly_chart(px.histogram(df_f, x="n_measurements", title="Filtered Measurement Counts"), use_container_width=True)
+        st.dataframe(df_f.head(50), use_container_width=True)
+    else:
+        st.warning("Filters are too strict. No data to display.")
 
 with tab_about:
     st.markdown("""
