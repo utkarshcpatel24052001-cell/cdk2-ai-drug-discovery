@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from io import BytesIO
 from pathlib import Path
 from typing import Optional, Tuple
@@ -10,7 +11,6 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem, Descriptors, Draw, QED, rdMolDescriptors
 
@@ -25,9 +25,6 @@ DATA_PATH = PROJECT / "cdk2_pic50_clean.parquet"
 # Model will be downloaded to this local path (do NOT commit the 139MB file to GitHub)
 MODEL_PATH = PROJECT / "models" / "cdk2_rf_final_all_data.joblib"
 
-# Google Drive direct-download URL (uc?id=FILE_ID)
-MODEL_DRIVE_URL = "https://drive.google.com/uc?id=1pOgZVHG7BfrcXE7ZmHJNM9CMnsBNlCQa"
-
 FP_RADIUS = 2
 FP_NBITS = 2048
 
@@ -35,34 +32,66 @@ FP_NBITS = 2048
 SIM_HIGH = 0.50
 SIM_MED = 0.30
 
+# Google Drive file id for the model
+MODEL_DRIVE_FILE_ID = "1pOgZVHG7BfrcXE7ZmHJNM9CMnsBNlCQa"
+
 st.set_page_config(page_title="ChemBLitz — CDK2 Scientific Predictor", layout="wide")
 
 
 # =========================
-# Download helper (Google Drive)
+# Download helper (Google Drive, no gdown)
 # =========================
+def _download_file_from_google_drive(file_id: str, destination: Path) -> None:
+    """
+    Download large files from Google Drive by handling confirm tokens.
+    File must be shared as: Anyone with the link (Viewer).
+    """
+    session = requests.Session()
+
+    def get_confirm_token(resp) -> str | None:
+        for k, v in resp.cookies.items():
+            if k.startswith("download_warning"):
+                return v
+        # Sometimes token is embedded in HTML
+        m = re.search(r"confirm=([0-9A-Za-z_]+)", resp.text)
+        return m.group(1) if m else None
+
+    url = "https://drive.google.com/uc?export=download"
+    params = {"id": file_id}
+
+    resp = session.get(url, params=params, stream=True, timeout=60)
+    token = get_confirm_token(resp)
+    if token:
+        params["confirm"] = token
+        resp = session.get(url, params=params, stream=True, timeout=60)
+
+    resp.raise_for_status()
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(destination, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+    # sanity check: <1MB likely HTML error page / blocked download
+    if destination.stat().st_size < 1024 * 1024:
+        raise RuntimeError(
+            "Downloaded file is too small; likely not the model file. "
+            "Check Google Drive sharing (Anyone with the link) and quota/virus-scan interstitial."
+        )
+
+
 def ensure_model_present(model_path: Path) -> None:
     """
     Ensure the model file exists locally.
-    If missing, download from Google Drive using gdown (first run only).
+    If missing, download from Google Drive (first run only).
     """
     if model_path.exists():
         return
 
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        import gdown  # type: ignore
-    except Exception as e:
-        raise RuntimeError("gdown is not installed. Add `gdown` to requirements.txt") from e
-
     with st.spinner("Downloading model from Google Drive (first run only)…"):
-        out = gdown.download(MODEL_DRIVE_URL, str(model_path), quiet=False, fuzzy=True)
-        if (not out) or (not model_path.exists()):
-            raise RuntimeError(
-                "Model download failed. "
-                "Check that Google Drive sharing is set to: Anyone with the link = Viewer."
-            )
+        _download_file_from_google_drive(MODEL_DRIVE_FILE_ID, model_path)
 
 
 # =========================
@@ -289,7 +318,9 @@ if "smiles" not in st.session_state:
 
 examples = build_real_examples_from_dataset(df)
 
-tab_pred, tab_val, tab_data, tab_about = st.tabs(["Predict", "Validate (Similarity)", "Dataset Dashboard", "Methodology"])
+tab_pred, tab_val, tab_data, tab_about = st.tabs(
+    ["Predict", "Validate (Similarity)", "Dataset Dashboard", "Methodology"]
+)
 
 with tab_pred:
     c_left, c_right = st.columns([1.05, 0.95], gap="large")
@@ -361,7 +392,10 @@ with tab_pred:
             input_in_filtered = False
             if input_is_in_dataset and "inchikey" in df_f.columns:
                 input_in_filtered = len(df_f[df_f["inchikey"].astype(str) == ik]) > 0
-                st.write("Included after filters:", "✅ Yes" if input_in_filtered else "❌ No (excluded by current filters)")
+                st.write(
+                    "Included after filters:",
+                    "✅ Yes" if input_in_filtered else "❌ No (excluded by current filters)",
+                )
 
             # Name (preferred) + nomenclature identifier fallback
             pref = chembl_pref_name_from_chembl_id(chembl_id) if chembl_id else None
@@ -382,7 +416,11 @@ with tab_pred:
 
             # Similarity for applicability domain (FULL dataset)
             fps_all, _idx_map_all = build_dataset_fps(df)
-            sims_all = np.array(DataStructs.BulkTanimotoSimilarity(fp, fps_all), dtype=float) if len(fps_all) else np.array([])
+            sims_all = (
+                np.array(DataStructs.BulkTanimotoSimilarity(fp, fps_all), dtype=float)
+                if len(fps_all)
+                else np.array([])
+            )
             max_sim = float(sims_all.max()) if len(sims_all) else 0.0
             mean_sim = float(sims_all.mean()) if len(sims_all) else 0.0
 
@@ -463,15 +501,23 @@ with tab_val:
         value=False,
         help="Turn ON to restrict neighbor evidence to the filtered subset.",
     )
-    # Use the same filters computed in Predict tab if available; otherwise default to full df
-    # (When user hasn't pressed Predict yet, df_f isn't created; we handle gracefully.)
     df_nn = df
 
-    # Recompute filters here as well (so the tab is independent)
     pic50_min, pic50_max = float(df["pic50"].min()), float(df["pic50"].max())
-    # Use same defaults; user-adjusted values persist because Streamlit stores widget state
-    pic50_range = st.slider("pIC50 range (neighbors)", pic50_min, pic50_max, (pic50_min, pic50_max), key="nn_pic50")
-    min_n = st.slider("Min measurements (neighbors)", 1, int(df["n_measurements"].max()), 1, key="nn_min_n")
+    pic50_range = st.slider(
+        "pIC50 range (neighbors)",
+        pic50_min,
+        pic50_max,
+        (pic50_min, pic50_max),
+        key="nn_pic50",
+    )
+    min_n = st.slider(
+        "Min measurements (neighbors)",
+        1,
+        int(df["n_measurements"].max()),
+        1,
+        key="nn_min_n",
+    )
 
     df_f2 = df[
         (df["pic50"] >= pic50_range[0])
@@ -516,8 +562,20 @@ with tab_data:
     st.write("These plots show how your filters change which compounds are included.")
 
     pic50_min, pic50_max = float(df["pic50"].min()), float(df["pic50"].max())
-    pic50_range = st.slider("pIC50 range (dashboard)", pic50_min, pic50_max, (pic50_min, pic50_max), key="dash_pic50")
-    min_n = st.slider("Min measurements (dashboard)", 1, int(df["n_measurements"].max()), 1, key="dash_min_n")
+    pic50_range = st.slider(
+        "pIC50 range (dashboard)",
+        pic50_min,
+        pic50_max,
+        (pic50_min, pic50_max),
+        key="dash_pic50",
+    )
+    min_n = st.slider(
+        "Min measurements (dashboard)",
+        1,
+        int(df["n_measurements"].max()),
+        1,
+        key="dash_min_n",
+    )
 
     df_f = df[
         (df["pic50"] >= pic50_range[0])
