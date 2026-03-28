@@ -23,7 +23,7 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 st.set_page_config(page_title="ChemBLitz Professional | CDK2 Suite", layout="wide")
 
 # =========================
-# 2. SAFE PROFESSIONAL CSS (NO OVERLAP)
+# 2. SAFE PROFESSIONAL CSS 
 # =========================
 st.markdown(
     """
@@ -51,7 +51,8 @@ section[data-testid="stSidebar"] * {
 
 /* Tabs */
 button[data-baseweb="tab"] {
-  font-size: 16px !important;
+  font-size: 18px !important;
+  font-weight: bold !important;
 }
 
 /* Metric widgets */
@@ -67,22 +68,16 @@ div[data-testid="stMetricValue"] {
   line-height: 1.1 !important;
 }
 
-/* Expander header: fix chevron/text collision */
-div[data-testid="stExpander"] summary {
-  font-size: 16px !important;
-  line-height: 1.25 !important;
-}
+/* Priority Colors */
+.priority-high { color: #2f855a; font-weight: bold; }
+.priority-med { color: #c05621; font-weight: bold; }
+.priority-low { color: #c53030; font-weight: bold; }
 
 /* Buttons */
 .stButton > button {
   font-size: 16px !important;
   border-radius: 6px !important;
   padding: 0.55em 1em !important;
-}
-
-/* Reduce excessive top padding */
-.block-container {
-  padding-top: 1.2rem !important;
 }
 </style>
 """,
@@ -104,20 +99,17 @@ SIM_HIGH = 0.50
 SIM_MED = 0.30
 SIM_NEIGHBOR = 0.40
 
-
 # =========================
 # 4. DOWNLOAD + LOAD ASSETS
 # =========================
 def download_model(file_id: str, dest: Path):
     gdown.download(id=file_id, output=str(dest), quiet=False)
 
-
 @st.cache_resource
 def get_pains_filter():
     params = FilterCatalogParams()
     params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
     return FilterCatalog(params)
-
 
 @st.cache_resource
 def load_assets():
@@ -130,20 +122,16 @@ def load_assets():
     model = joblib.load(MODEL_PATH)
     df = pd.read_parquet(DATA_PATH)
 
-    # Validate required columns
     required = {"smiles", "pic50", "n_measurements"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Dataset missing required columns: {sorted(missing)}")
 
-    # Normalize dtypes
     df = df.copy()
     df["pic50"] = pd.to_numeric(df["pic50"], errors="coerce")
     df["n_measurements"] = pd.to_numeric(df["n_measurements"], errors="coerce").fillna(0).astype(int)
 
-    # Optional columns: inchikey, molecule_chembl_id, ic50_nM
     return model, df
-
 
 # =========================
 # 5. CHEM HELPERS
@@ -151,32 +139,24 @@ def load_assets():
 def mol_from_smiles(smiles: str) -> Optional[Chem.Mol]:
     try:
         mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None
+        if mol is None: return None
         Chem.SanitizeMol(mol)
         return mol
     except Exception:
         return None
 
-
 def canonical_smiles(mol: Chem.Mol) -> str:
     return Chem.MolToSmiles(mol, canonical=True)
 
-
 def inchikey(mol: Chem.Mol) -> str:
-    try:
-        return Chem.inchi.MolToInchiKey(mol)
-    except Exception:
-        return "N/A"
-
+    try: return Chem.inchi.MolToInchiKey(mol)
+    except Exception: return "N/A"
 
 def keep_largest_fragment(mol: Chem.Mol) -> Chem.Mol:
     frags = Chem.GetMolFrags(mol, asMols=True, sanitizeFrags=True)
-    if not frags:
-        return mol
+    if not frags: return mol
     frags = sorted(frags, key=lambda m: m.GetNumHeavyAtoms(), reverse=True)
     return frags[0]
-
 
 def mol_to_png(mol: Chem.Mol):
     img = Draw.MolToImage(mol, size=(600, 400))
@@ -184,71 +164,42 @@ def mol_to_png(mol: Chem.Mol):
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-
 def morgan_fp(mol: Chem.Mol):
     return AllChem.GetMorganFingerprintAsBitVect(mol, FP_RADIUS, nBits=FP_NBITS)
-
 
 def fp_to_array(fp) -> np.ndarray:
     arr = np.zeros((FP_NBITS,), dtype=np.int8)
     DataStructs.ConvertToNumpyArray(fp, arr)
     return arr
 
-
 def pic50_to_ic50_nM(pic50: float) -> float:
     return float(10 ** (9.0 - pic50))
-
-
-def potency_band(pic50: float) -> str:
-    if pic50 >= 8:
-        return "Strong"
-    if pic50 >= 6:
-        return "Moderate"
-    return "Weak"
-
-
-def uncertainty_band(std: float) -> str:
-    if std <= 0.35:
-        return "Low (good)"
-    if std <= 0.60:
-        return "Medium"
-    return "High (warning)"
-
-
-def ad_band(max_sim: float) -> str:
-    if max_sim >= SIM_HIGH:
-        return "In-domain"
-    if max_sim >= SIM_MED:
-        return "Borderline"
-    return "Out-of-domain risk"
-
 
 def calculate_ligand_efficiency(pic50: float, mol: Chem.Mol) -> float:
     n_heavy = mol.GetNumHeavyAtoms()
     return (1.37 * pic50 / n_heavy) if n_heavy > 0 else 0.0
 
+def calculate_bei(pic50: float, mw: float) -> float:
+    # Binding Efficiency Index = pIC50 / (MW / 1000)
+    return (pic50 / (mw / 1000)) if mw > 0 else 0.0
 
 def check_pains(mol: Chem.Mol, catalog: FilterCatalog) -> list[str]:
     entries = catalog.GetMatches(mol)
     return [e.GetDescription() for e in entries]
-
 
 @st.cache_data(show_spinner=False)
 def chembl_pref_name_from_chembl_id(chembl_id: str) -> Optional[str]:
     try:
         url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{chembl_id}.json"
         r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            return None
+        if r.status_code != 200: return None
         name = r.json().get("pref_name")
         return str(name) if name else None
     except Exception:
         return None
 
-
 def chembl_molecule_url(chembl_id: str) -> str:
     return f"https://www.ebi.ac.uk/chembl/compound_report_card/{chembl_id}/"
-
 
 # =========================
 # 6. MODEL PREDICT + EVIDENCE
@@ -259,26 +210,21 @@ def rf_predict(model, mol: Chem.Mol) -> tuple[float, float, object]:
     preds = np.array([t.predict(X)[0] for t in model.estimators_], dtype=float)
     return float(preds.mean()), float(preds.std(ddof=1)), fp
 
-
 @st.cache_resource
 def build_dataset_fps(df: pd.DataFrame):
     fps, idx = [], []
     for i, s in enumerate(df["smiles"].astype(str).tolist()):
         m = Chem.MolFromSmiles(s)
-        if m is None:
-            continue
+        if m is None: continue
         fps.append(morgan_fp(m))
         idx.append(i)
     return fps, np.array(idx, dtype=int)
 
-
 def compute_similarity_and_neighbors(query_fp, *, df_evidence: pd.DataFrame, topk: int):
     fps, idx_map = build_dataset_fps(df_evidence)
-    if len(fps) == 0:
-        return 0.0, 0.0, 0, pd.DataFrame()
+    if len(fps) == 0: return 0.0, 0.0, 0, pd.DataFrame()
 
     sims = np.array(DataStructs.BulkTanimotoSimilarity(query_fp, fps), dtype=float)
-
     max_sim = float(sims.max()) if len(sims) else 0.0
     mean_sim = float(sims.mean()) if len(sims) else 0.0
     n_ge = int((sims >= SIM_NEIGHBOR).sum())
@@ -287,255 +233,113 @@ def compute_similarity_and_neighbors(query_fp, *, df_evidence: pd.DataFrame, top
     rows = []
     for j in top:
         row = df_evidence.iloc[int(idx_map[j])]
-        rows.append(
-            {
-                "similarity": float(sims[j]),
-                "molecule_chembl_id": str(row.get("molecule_chembl_id", "")),
-                "pic50_exp": float(row.get("pic50", np.nan)),
-                "ic50_nM_exp": float(row.get("ic50_nM", np.nan)),
-                "n_measurements": int(row.get("n_measurements", 0)),
-                "smiles": str(row.get("smiles", "")),
-            }
-        )
+        rows.append({
+            "Similarity": float(sims[j]),
+            "ChEMBL_ID": str(row.get("molecule_chembl_id", "")),
+            "pIC50_Exp": float(row.get("pic50", np.nan)),
+            "SMILES": str(row.get("smiles", ""))
+        })
     return max_sim, mean_sim, n_ge, pd.DataFrame(rows)
 
-
-def make_decision_summary(
-    *,
-    pred_pic50: float,
-    pred_std: float,
-    max_sim: float,
-    pains_hits: list[str],
-    le: float,
-    mw: float,
-    clogp: float,
-    tpsa: float,
-    rotb: int,
-):
+# =========================
+# 7. PROFESSIONAL MEDCHEM TRIAGE LOGIC
+# =========================
+def make_decision_summary(pred_pic50: float, pred_std: float, max_sim: float, pains_hits: list[str], 
+                          le: float, bei: float, mw: float, clogp: float, tpsa: float, rotb: int, hbd: int, hba: int):
     rationale = []
     next_steps = []
+    
+    # 1. Lipinski Rule of 5 check
+    ro5_violations = sum([mw > 500, clogp > 5, hbd > 5, hba > 10])
 
-    pot = potency_band(pred_pic50)
-    unc = uncertainty_band(pred_std)
-    dom = ad_band(max_sim)
-
-    rationale.append(f"Predicted potency: {pot} (pIC50={pred_pic50:.2f}, IC50≈{pic50_to_ic50_nM(pred_pic50):.1f} nM).")
-    rationale.append(f"Uncertainty (tree σ): {pred_std:.3f} → {unc}.")
-    rationale.append(f"Applicability domain: max similarity={max_sim:.3f} → {dom}.")
-    rationale.append(f"Ligand Efficiency (LE)={le:.2f} (rule-of-thumb: ≥0.30 acceptable; ≥0.35 strong).")
-
-    if pains_hits:
-        rationale.append(f"PAINS alerts detected: {', '.join(pains_hits)}.")
-        next_steps.append("Run orthogonal counterscreens and confirm signal is not assay interference.")
-        next_steps.append("Consider redesign to remove flagged PAINS motifs if feasible.")
-
-    # Developability heuristics
-    if mw > 500:
-        next_steps.append("MolWt > 500: consider scaffold simplification.")
-    if clogp > 4.5:
-        next_steps.append("High cLogP: increase polarity / reduce hydrophobes (solubility & clearance risk).")
-    if tpsa > 140:
-        next_steps.append("TPSA > 140: permeability risk; reduce PSA / mask donors.")
-    if rotb > 10:
-        next_steps.append("RotB > 10: consider rigidification to improve PK and binding entropy.")
-
-    if max_sim < SIM_MED:
-        next_steps.append("Low similarity: treat as out-of-domain; validate experimentally before optimization.")
-        next_steps.append("Search for closer analogs to increase confidence in predictions.")
-
-    if not next_steps:
-        next_steps.append("Proceed to selectivity profiling (CDK1/4/6) + early ADME screens.")
-
-    # Priority scoring
-    score = 0
-    score += 2 if pred_pic50 >= 7.0 else (1 if pred_pic50 >= 6.0 else 0)
-    score += 1 if pred_std <= 0.60 else 0
-    score += 1 if max_sim >= SIM_MED else 0
-    score -= 2 if pains_hits else 0
-
-    if score >= 3:
-        priority = "High"
-    elif score >= 2:
-        priority = "Medium"
+    # 2. Rationale building
+    rationale.append(f"Predicted Potency: {pred_pic50:.2f} pIC50 (~{pic50_to_ic50_nM(pred_pic50):.1f} nM).")
+    
+    if le >= 0.3 and bei >= 14:
+        rationale.append(f"Highly Efficient Binding: LE ({le:.2f}) and BEI ({bei:.1f}) are optimal.")
     else:
+        rationale.append(f"Sub-optimal Efficiency: LE ({le:.2f}), BEI ({bei:.1f}). May be driven by lipophilicity/bulk.")
+
+    if ro5_violations > 0:
+        rationale.append(f"Lipinski Violations: {ro5_violations}/4. Potential oral bioavailability issues.")
+    else:
+        rationale.append("Lipinski Compliant: 0 Violations (Good oral bioavailability profile).")
+
+    # 3. Next Steps & Warnings
+    if pains_hits:
+        next_steps.append(f"🛑 CRITICAL: PAINS detected ({pains_hits[0]}). High risk of assay interference.")
+    if max_sim < SIM_MED:
+        next_steps.append("⚠️ Domain Extrapolation: Scaffold is novel compared to training set. Validate experimentally.")
+    if rotb > 10:
+        next_steps.append("⚠️ High Flexibility (RotB > 10): Consider rigidifying scaffold to improve binding entropy.")
+    if tpsa > 140:
+        next_steps.append("⚠️ High TPSA (> 140): Poor predicted membrane permeability.")
+        
+    if not next_steps:
+        next_steps.append("✅ Excellent Profile. Proceed to secondary kinase screening (CDK1/4/6) and in-vitro ADME.")
+
+    # 4. Strict Professional Triage Scoring
+    if pains_hits or ro5_violations >= 2 or pred_pic50 < 5.5:
         priority = "Low"
+    elif pred_pic50 >= 7.0 and ro5_violations == 0 and le >= 0.3 and max_sim >= 0.35:
+        priority = "High"
+    else:
+        priority = "Medium"
 
-    return priority, rationale, next_steps
-
+    return priority, rationale, next_steps, ro5_violations
 
 # =========================
-# 7. BATCH SCORING
+# 8. BATCH SCORING
 # =========================
 @dataclass
 class BatchRow:
-    ok: bool
-    error: str
-    smiles_in: str
     smiles_used: str
     pred_pic50: float
     pred_ic50_nM: float
-    pred_std: float
-    potency: str
+    priority: str
     ligand_efficiency: float
+    binding_efficiency_idx: float
     max_sim: float
-    mean_sim: float
-    neighbors_ge_0_4: int
-    ad_band: str
-    pains_count: int
-    pains_hits: str
-    scaffold_smiles: str
+    ro5_violations: int
+    pains_alert: bool
     molwt: float
     clogp: float
     tpsa: float
-    rotb: int
-    hbd: int
-    hba: int
-    qed: float
-    chembl_id: str
-    chembl_name: str
-    chembl_url: str
 
+def score_smiles_row(smiles: str, model, pains_catalog, df_evidence, strip_salts, compute_ad) -> BatchRow:
+    mol = mol_from_smiles(smiles)
+    if not mol:
+        return BatchRow(smiles, np.nan, np.nan, "Error", np.nan, np.nan, np.nan, 0, False, np.nan, np.nan, np.nan)
 
-def score_smiles_row(
-    smiles: str,
-    *,
-    model,
-    pains_catalog,
-    df_evidence: pd.DataFrame,
-    df_full: pd.DataFrame,
-    strip_salts: bool,
-    compute_ad: bool,
-    topk_neighbors: int,
-) -> BatchRow:
-    smiles_in = (smiles or "").strip()
-    if not smiles_in:
-        return BatchRow(
-            ok=False,
-            error="Empty SMILES",
-            smiles_in="",
-            smiles_used="",
-            pred_pic50=np.nan,
-            pred_ic50_nM=np.nan,
-            pred_std=np.nan,
-            potency="",
-            ligand_efficiency=np.nan,
-            max_sim=np.nan,
-            mean_sim=np.nan,
-            neighbors_ge_0_4=0,
-            ad_band="",
-            pains_count=0,
-            pains_hits="",
-            scaffold_smiles="",
-            molwt=np.nan,
-            clogp=np.nan,
-            tpsa=np.nan,
-            rotb=0,
-            hbd=0,
-            hba=0,
-            qed=np.nan,
-            chembl_id="",
-            chembl_name="",
-            chembl_url="",
-        )
-
-    mol = mol_from_smiles(smiles_in)
-    if mol is None:
-        return BatchRow(
-            ok=False,
-            error="Invalid SMILES",
-            smiles_in=smiles_in,
-            smiles_used="",
-            pred_pic50=np.nan,
-            pred_ic50_nM=np.nan,
-            pred_std=np.nan,
-            potency="",
-            ligand_efficiency=np.nan,
-            max_sim=np.nan,
-            mean_sim=np.nan,
-            neighbors_ge_0_4=0,
-            ad_band="",
-            pains_count=0,
-            pains_hits="",
-            scaffold_smiles="",
-            molwt=np.nan,
-            clogp=np.nan,
-            tpsa=np.nan,
-            rotb=0,
-            hbd=0,
-            hba=0,
-            qed=np.nan,
-            chembl_id="",
-            chembl_name="",
-            chembl_url="",
-        )
-
-    if strip_salts:
-        mol = keep_largest_fragment(mol)
-
+    if strip_salts: mol = keep_largest_fragment(mol)
     smiles_used = canonical_smiles(mol)
 
-    pred_pic50, pred_std, fp = rf_predict(model, mol)
-    pred_ic50 = pic50_to_ic50_nM(pred_pic50)
-    le = calculate_ligand_efficiency(pred_pic50, mol)
+    p_mean, p_std, fp = rf_predict(model, mol)
+    mw, clogp = Descriptors.MolWt(mol), Descriptors.MolLogP(mol)
+    hbd, hba = rdMolDescriptors.CalcNumHBD(mol), rdMolDescriptors.CalcNumHBA(mol)
+    
+    le = calculate_ligand_efficiency(p_mean, mol)
+    bei = calculate_bei(p_mean, mw)
     pains_hits = check_pains(mol, pains_catalog)
 
-    scaffold_mol = MurckoScaffold.GetScaffoldForMol(mol)
-    scaffold_smiles = Chem.MolToSmiles(scaffold_mol) if scaffold_mol is not None else ""
-
-    # dataset match by inchikey (if present)
-    cid = ""
-    cname = ""
-    curl = ""
-    if "inchikey" in df_full.columns:
-        ik = inchikey(mol)
-        m = df_full[df_full["inchikey"].astype(str) == ik]
-        if len(m) > 0:
-            cid = str(m.iloc[0].get("molecule_chembl_id", "")).strip()
-            if cid:
-                cname = chembl_pref_name_from_chembl_id(cid) or ""
-                curl = chembl_molecule_url(cid)
-
     max_sim = 0.0
-    mean_sim = 0.0
-    n_ge = 0
     if compute_ad:
-        max_sim, mean_sim, n_ge, _neigh = compute_similarity_and_neighbors(fp, df_evidence=df_evidence, topk=topk_neighbors)
+        max_sim, _, _, _ = compute_similarity_and_neighbors(fp, df_evidence=df_evidence, topk=1)
+
+    priority, _, _, ro5 = make_decision_summary(p_mean, p_std, max_sim, pains_hits, le, bei, mw, clogp, rdMolDescriptors.CalcTPSA(mol), rdMolDescriptors.CalcNumRotatableBonds(mol), hbd, hba)
 
     return BatchRow(
-        ok=True,
-        error="",
-        smiles_in=smiles_in,
-        smiles_used=smiles_used,
-        pred_pic50=float(pred_pic50),
-        pred_ic50_nM=float(pred_ic50),
-        pred_std=float(pred_std),
-        potency=potency_band(pred_pic50),
-        ligand_efficiency=float(le),
-        max_sim=float(max_sim),
-        mean_sim=float(mean_sim),
-        neighbors_ge_0_4=int(n_ge),
-        ad_band=ad_band(max_sim) if compute_ad else "",
-        pains_count=len(pains_hits),
-        pains_hits="; ".join(pains_hits),
-        scaffold_smiles=scaffold_smiles,
-        molwt=float(Descriptors.MolWt(mol)),
-        clogp=float(Descriptors.MolLogP(mol)),
-        tpsa=float(rdMolDescriptors.CalcTPSA(mol)),
-        rotb=int(rdMolDescriptors.CalcNumRotatableBonds(mol)),
-        hbd=int(rdMolDescriptors.CalcNumHBD(mol)),
-        hba=int(rdMolDescriptors.CalcNumHBA(mol)),
-        qed=float(QED.qed(mol)),
-        chembl_id=cid,
-        chembl_name=cname,
-        chembl_url=curl,
+        smiles_used=smiles_used, pred_pic50=p_mean, pred_ic50_nM=pic50_to_ic50_nM(p_mean),
+        priority=priority, ligand_efficiency=le, binding_efficiency_idx=bei, max_sim=max_sim,
+        ro5_violations=ro5, pains_alert=len(pains_hits) > 0,
+        molwt=mw, clogp=clogp, tpsa=rdMolDescriptors.CalcTPSA(mol)
     )
 
-
 # =========================
-# 8. APP START
+# 9. APP START
 # =========================
 st.title("CDK2 Pharmacological Diagnostic Suite")
-st.markdown("#### Prediction + Evidence + Interpretation for CDK2 inhibitor discovery")
+st.markdown("#### High-Throughput Prediction & ADMET Intelligence for CDK2 Inhibitor Discovery")
 st.divider()
 
 try:
@@ -545,25 +349,21 @@ except Exception as e:
     st.error(f"Critical System Failure: {e}")
     st.stop()
 
-# Sidebar controls
+# Sidebar
 with st.sidebar:
-    st.header("Controls")
-
-    mode = st.radio("Mode", ["Single molecule", "Batch (CSV)"], index=0)
-
-    st.subheader("Evidence subset (applies to AD + neighbors)")
+    st.header("Global Controls")
+    st.subheader("Reference Evidence Subset")
     p_min, p_max = float(df["pic50"].min()), float(df["pic50"].max())
-    pic_range = st.slider("pIC50 inclusion range", p_min, p_max, (p_min, p_max))
+    pic_range = st.slider("Dataset pIC50 Range", p_min, p_max, (p_min, p_max))
     min_meas = st.slider("Min measurements", 1, int(df["n_measurements"].max()), 1)
 
-    st.subheader("Analysis options")
-    strip_salts = st.checkbox("Keep largest fragment (salt stripping)", value=True)
-    compute_ad = st.checkbox("Compute applicability domain + neighbors", value=True)
-    topk_neighbors = st.slider("Top-K neighbors", 5, 25, 10)
-
+    st.subheader("Computational Engine")
+    strip_salts = st.checkbox("Strip Salts (Keep Largest Fragment)", value=True)
+    compute_ad = st.checkbox("Compute Applicability Domain (AD)", value=True)
+    
 df_f = df[(df["pic50"] >= pic_range[0]) & (df["pic50"] <= pic_range[1]) & (df["n_measurements"] >= min_meas)].copy()
 
-tab1, tab2, tab3 = st.tabs(["Lead Diagnostic", "Chemical Space", "Methodology"])
+tab1, tab2, tab3 = st.tabs(["Lead Diagnostic", "Batch CSV Screening", "Chemical Space"])
 
 # =========================
 # Tab 1: Single molecule
@@ -572,259 +372,119 @@ with tab1:
     col_input, col_results = st.columns([1, 1.4], gap="large")
 
     with col_input:
-        st.subheader("I. Query definition")
-
+        st.subheader("I. Query Definition")
         top_binders = df.sort_values("pic50", ascending=False).head(5)
-        refs = {
-            f"Reference: {r.get('molecule_chembl_id','')} (pIC50 {r['pic50']:.1f})": r["smiles"]
-            for _, r in top_binders.iterrows()
-        }
-        selected_ref = st.selectbox("Select validated reference ligand", ["None"] + list(refs.keys()))
-        if selected_ref != "None":
+        refs = {f"Ref: {r.get('molecule_chembl_id','')} (pIC50 {r['pic50']:.1f})": r["smiles"] for _, r in top_binders.iterrows()}
+        selected_ref = st.selectbox("Load Validated Reference", ["Custom SMILES"] + list(refs.keys()))
+        
+        if selected_ref != "Custom SMILES":
             st.session_state["query_smiles"] = refs[selected_ref]
 
-        target_smiles = st.text_input("Input SMILES", value=st.session_state.get("query_smiles", ""))
-
-        execute = st.button("Execute diagnostic analysis", type="primary", use_container_width=True)
-
-        st.markdown("---")
-        st.subheader("II. Evidence subset status")
-        st.info(f"Evidence subset size: {len(df_f)} compounds (from {len(df)} total)")
-
-        with st.expander("What do these numbers mean?", expanded=False):
-            st.markdown(
-                """
-- **pIC50**: -log10(IC50 in molar). +1 pIC50 ≈ 10× stronger potency.
-- **IC50 (nM)**: 10^(9 - pIC50). Reported for intuition.
-- **σ (uncertainty)**: std across RF trees (model disagreement). Not a calibrated CI.
-- **Applicability Domain (AD)**: similarity to training chemistry. Low similarity = extrapolation risk.
-- **Ligand Efficiency (LE)**: potency normalized by size (heavy atom count). Useful for lead-likeness.
-- **PAINS**: substructures associated with assay interference. Treat as risk flags, not absolute truth.
-"""
-            )
+        target_smiles = st.text_input("Target SMILES string", value=st.session_state.get("query_smiles", ""))
+        execute = st.button("Execute Diagnostic", type="primary", use_container_width=True)
+        st.info(f"Active Evidence Subset: {len(df_f)} / {len(df)} Compounds")
 
     with col_results:
         if execute and target_smiles:
             mol = mol_from_smiles(target_smiles)
             if mol is None:
-                st.error("Invalid structure: SMILES parsing failed.")
+                st.error("Structure Error: Invalid SMILES.")
             else:
-                if strip_salts:
-                    mol = keep_largest_fragment(mol)
+                if strip_salts: mol = keep_largest_fragment(mol)
 
                 p_mean, p_std, fp = rf_predict(model, mol)
+                mw, clogp = Descriptors.MolWt(mol), Descriptors.MolLogP(mol)
+                hbd, hba = rdMolDescriptors.CalcNumHBD(mol), rdMolDescriptors.CalcNumHBA(mol)
+                tpsa, rotb = rdMolDescriptors.CalcTPSA(mol), rdMolDescriptors.CalcNumRotatableBonds(mol)
+                
                 le_score = calculate_ligand_efficiency(p_mean, mol)
+                bei_score = calculate_bei(p_mean, mw)
                 pains_hits = check_pains(mol, pains_catalog)
 
-                scaffold_mol = MurckoScaffold.GetScaffoldForMol(mol)
-                scaffold_smiles = Chem.MolToSmiles(scaffold_mol) if scaffold_mol is not None else ""
-
-                # AD + neighbors evidence
-                max_sim = 0.0
-                mean_sim = 0.0
-                n_ge = 0
-                neighbors = pd.DataFrame()
+                max_sim, mean_sim, n_ge, neighbors = 0.0, 0.0, 0, pd.DataFrame()
                 if compute_ad:
-                    max_sim, mean_sim, n_ge, neighbors = compute_similarity_and_neighbors(fp, df_evidence=df_f, topk=topk_neighbors)
+                    max_sim, mean_sim, n_ge, neighbors = compute_similarity_and_neighbors(fp, df_evidence=df_f, topk=5)
 
-                # Descriptors
-                mw = float(Descriptors.MolWt(mol))
-                clogp = float(Descriptors.MolLogP(mol))
-                tpsa = float(rdMolDescriptors.CalcTPSA(mol))
-                rotb = int(rdMolDescriptors.CalcNumRotatableBonds(mol))
-
-                # Decision summary
-                priority, rationale, next_steps = make_decision_summary(
-                    pred_pic50=p_mean,
-                    pred_std=p_std,
-                    max_sim=max_sim if compute_ad else 0.0,
-                    pains_hits=pains_hits,
-                    le=le_score,
-                    mw=mw,
-                    clogp=clogp,
-                    tpsa=tpsa,
-                    rotb=rotb,
+                priority, rationale, next_steps, ro5 = make_decision_summary(
+                    p_mean, p_std, max_sim, pains_hits, le_score, bei_score, mw, clogp, tpsa, rotb, hbd, hba
                 )
 
+                # Output Visuals
                 with st.container(border=True):
-                    st.markdown("## Decision summary")
-                    if priority == "High":
-                        st.success(f"Priority: **{priority}**")
-                    elif priority == "Medium":
-                        st.warning(f"Priority: **{priority}**")
-                    else:
-                        st.info(f"Priority: **{priority}**")
-
-                    st.markdown("**Rationale**")
-                    for r in rationale:
-                        st.write(f"- {r}")
-
-                    st.markdown("**Recommended next steps**")
-                    for s in next_steps:
-                        st.write(f"- {s}")
+                    st.markdown(f"### MedChem Decision: <span class='priority-{priority.lower()}'>{priority} Priority Lead</span>", unsafe_allow_html=True)
+                    st.markdown("**Scientific Rationale:**")
+                    for r in rationale: st.write(f"• {r}")
+                    st.markdown("**Actionable Next Steps:**")
+                    for s in next_steps: st.write(f"• {s}")
 
                 with st.container(border=True):
-                    st.markdown("### A. Affinity & efficiency")
+                    st.markdown("### A. Target Affinity & Efficiency")
                     cA, cB = st.columns([1, 1.5])
-                    cA.image(mol_to_png(mol), caption="Query structure (RDKit 2D)")
+                    cA.image(mol_to_png(mol), use_container_width=True)
                     with cB:
-                        m1, m2, m3, m4 = st.columns(4)
+                        m1, m2 = st.columns(2)
                         m1.metric("Pred pIC50", f"{p_mean:.2f}")
-                        m2.metric("Pred IC50 (nM)", f"{pic50_to_ic50_nM(p_mean):.1f}")
-                        m3.metric("σ (trees)", f"{p_std:.3f}")
-                        m4.metric("LE", f"{le_score:.2f}")
-
-                        st.caption(f"Potency band: **{potency_band(p_mean)}**")
-                        st.caption(f"Uncertainty band: **{uncertainty_band(p_std)}**")
+                        m2.metric("IC50 (nM)", f"{pic50_to_ic50_nM(p_mean):.1f}")
+                        m3, m4 = st.columns(2)
+                        m3.metric("Ligand Efficiency (LE)", f"{le_score:.2f}")
+                        m4.metric("Binding Effic. (BEI)", f"{bei_score:.1f}")
 
                 with st.container(border=True):
-                    st.markdown("### B. Applicability domain (evidence)")
-                    if compute_ad:
-                        a1, a2, a3 = st.columns(3)
-                        a1.metric("Max similarity", f"{max_sim:.3f}")
-                        a2.metric("Mean similarity", f"{mean_sim:.3f}")
-                        a3.metric("Neighbors ≥ 0.4", str(n_ge))
-
-                        band = ad_band(max_sim)
-                        if band == "In-domain":
-                            st.success(band)
-                        elif band == "Borderline":
-                            st.warning(band)
-                        else:
-                            st.error(band)
-
-                        st.caption("Interpretation: max similarity < 0.30 implies extrapolation risk.")
-
-                        if len(neighbors):
-                            st.markdown("**Top nearest neighbors (experimental evidence)**")
-                            st.dataframe(neighbors, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("AD disabled in sidebar.")
-
-                with st.container(border=True):
-                    st.markdown("### C. Structural integrity & alerts")
-                    if pains_hits:
-                        st.error(f"PAINS alerts: {', '.join(pains_hits)}")
-                    else:
-                        st.success("No PAINS alerts detected.")
-
-                    st.markdown("**Murcko scaffold**")
-                    st.code(scaffold_smiles, language="text")
-
-                with st.container(border=True):
-                    st.markdown("### D. PhysChem / developability")
+                    st.markdown("### B. Drug-Likeness & ADMET Profiling")
                     d1, d2, d3, d4 = st.columns(4)
-                    d1.metric("MolWt", f"{mw:.1f}")
+                    d1.metric("Mol. Weight", f"{mw:.1f}")
                     d2.metric("cLogP", f"{clogp:.2f}")
                     d3.metric("TPSA", f"{tpsa:.1f}")
-                    d4.metric("QED", f"{QED.qed(mol):.2f}")
+                    d4.metric("Ro5 Violations", str(ro5))
+                    
+                    st.markdown(f"**Murcko Scaffold Base:** `{Chem.MolToSmiles(MurckoScaffold.GetScaffoldForMol(mol))}`")
 
-                    d5, d6, d7, d8 = st.columns(4)
-                    d5.metric("HBD", str(rdMolDescriptors.CalcNumHBD(mol)))
-                    d6.metric("HBA", str(rdMolDescriptors.CalcNumHBA(mol)))
-                    d7.metric("RotB", str(rotb))
-                    d8.metric("Rings", str(rdMolDescriptors.CalcNumRings(mol)))
-
-        else:
-            st.info("System ready. Define query parameters and execute diagnostic.")
+                if compute_ad and not neighbors.empty:
+                    with st.expander("View Nearest Training Neighbors & Applicability Domain", expanded=False):
+                        st.metric("Max Tanimoto Similarity", f"{max_sim:.3f}")
+                        st.dataframe(neighbors, use_container_width=True, hide_index=True)
 
 # =========================
-# Tab 2: Chemical space
+# Tab 2: Batch scoring
 # =========================
 with tab2:
-    st.subheader("Chemical Space (Evidence subset)")
-    if "ic50_nM" in df_f.columns:
-        fig = px.scatter(
-            df_f,
-            x="pic50",
-            y="ic50_nM",
-            size="n_measurements",
-            hover_name="molecule_chembl_id" if "molecule_chembl_id" in df_f.columns else None,
-            template="plotly_white",
-            labels={"pic50": "Experimental pIC50", "ic50_nM": "IC50 (nM)"},
-        )
-    else:
-        fig = px.scatter(
-            df_f,
-            x="pic50",
-            y="n_measurements",
-            size="n_measurements",
-            hover_name="molecule_chembl_id" if "molecule_chembl_id" in df_f.columns else None,
-            template="plotly_white",
-            labels={"pic50": "Experimental pIC50", "n_measurements": "n_measurements"},
-        )
-    st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Virtual Screening: High-Throughput Batch Scoring")
+    st.write("Upload a CSV library with a column named `smiles`. Output will append predictions, AD, and MedChem Priority.")
 
-    st.markdown("---")
-    st.subheader("Batch scoring (CSV)")
-
-    st.write("Upload a CSV with a column named `smiles`.")
-    file = st.file_uploader("Upload CSV", type=["csv"])
-
+    file = st.file_uploader("Upload Compound Library (.csv)", type=["csv"])
     if file is not None:
-        try:
-            batch = pd.read_csv(file)
-        except Exception as e:
-            st.error(f"Failed to read CSV: {e}")
-            st.stop()
-
+        batch = pd.read_csv(file)
         if "smiles" not in batch.columns:
-            st.error("CSV must include a `smiles` column.")
-            st.stop()
+            st.error("CSV format rejected: Must include a `smiles` column.")
+        else:
+            if st.button("Initialize Virtual Screen", type="primary"):
+                rows = []
+                with st.spinner(f"Scoring {len(batch)} molecules..."):
+                    for s in batch["smiles"].astype(str).tolist():
+                        r = score_smiles_row(s, model, pains_catalog, df_f, strip_salts, compute_ad)
+                        rows.append(asdict(r))
 
-        st.info(f"Uploaded rows: {len(batch)} | Evidence subset size: {len(df_f)}")
+                out = pd.DataFrame(rows)
+                st.success("Virtual Screening Complete.")
+                st.dataframe(out.head(25), use_container_width=True)
 
-        if st.button("Run batch scoring", type="primary"):
-            rows = []
-            with st.spinner("Scoring molecules..."):
-                for s in batch["smiles"].astype(str).tolist():
-                    r = score_smiles_row(
-                        s,
-                        model=model,
-                        pains_catalog=pains_catalog,
-                        df_evidence=df_f,
-                        df_full=df,
-                        strip_salts=strip_salts,
-                        compute_ad=compute_ad,
-                        topk_neighbors=topk_neighbors,
-                    )
-                    rows.append(asdict(r))
-
-            out = pd.DataFrame(rows)
-            st.success("Batch scoring complete.")
-            st.dataframe(out.head(50), use_container_width=True)
-
-            csv_bytes = out.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download results CSV",
-                data=csv_bytes,
-                file_name="cdk2_batch_results.csv",
-                mime="text/csv",
-            )
+                st.download_button(
+                    "Download Triage Results (CSV)",
+                    data=out.to_csv(index=False).encode("utf-8"),
+                    file_name="cdk2_virtual_screen_results.csv",
+                    mime="text/csv",
+                )
 
 # =========================
-# Tab 3: Methodology
+# Tab 3: Chemical space
 # =========================
 with tab3:
-    st.subheader("Methodology & interpretation")
-    st.markdown(
-        f"""
-### What this tool does
-- Predicts **CDK2 pIC50** using a RandomForest model trained on **Morgan fingerprints** (radius={FP_RADIUS}, {FP_NBITS} bits).
-- Provides **uncertainty** as tree-to-tree disagreement (σ).
-- Provides **evidence** via nearest-neighbor similarity to a filtered evidence subset.
-
-### Interpreting output (practical)
-- **pIC50**: +1 ≈ 10× potency shift.
-- **IC50(nM)**: 10^(9 - pIC50).
-- **σ**: model disagreement; treat high σ as low reliability.
-- **AD**: similarity-based domain; low similarity implies extrapolation risk.
-- **LE**: size-normalized potency. ≥0.30 acceptable; ≥0.35 strong.
-- **PAINS**: risk flags for assay interference.
-
-### Suggested real workflow
-1. Use prediction + AD + σ to triage.
-2. If good: prioritize synthesis/assay, run selectivity (CDK1/4/6), early ADME.
-3. If out-of-domain: find closer analogs or validate experimentally before optimizing.
-"""
-    )
+    st.subheader("Structure-Activity Relationship (SAR) Landscape")
+    if not df_f.empty:
+        fig = px.scatter(
+            df_f, x="pic50", y="n_measurements", size="n_measurements", 
+            hover_name="molecule_chembl_id" if "molecule_chembl_id" in df_f.columns else None,
+            template="plotly_white", labels={"pic50": "Experimental pIC50", "n_measurements": "Assay Measurements"},
+            title="Evidence Subset Topology"
+        )
+        st.plotly_chart(fig, use_container_width=True)
