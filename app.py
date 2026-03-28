@@ -9,204 +9,177 @@ import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import requests
 import streamlit as st
 from rdkit import Chem, DataStructs
-from rdkit.Chem import AllChem, Descriptors, Draw, QED, rdMolDescriptors
+from rdkit.Chem import AllChem, Descriptors, Draw, QED, rdMolDescriptors, Scaffolds
+from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
 
 # =========================
-# 1. STREAMLIT CONFIG
+# 1. SCIENTIFIC UI CONFIG
 # =========================
-st.set_page_config(page_title="ChemBLitz — CDK2 Predictor", layout="wide")
+st.set_page_config(page_title="ChemBLitz Professional | CDK2 Suite", layout="wide")
+
+# Injecting CSS for professional "Scientist" aesthetics and 20px font size
+st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Times+New+Roman&display=swap');
+    html, body, [class*="css"], .stMarkdown, p, li, div {
+        font-family: 'Times New Roman', serif !important;
+        font-size: 20px !important;
+    }
+    .stMetric label { font-size: 18px !important; font-weight: bold !important; }
+    .stMetric div { font-size: 28px !important; }
+    .stAlert { border-radius: 0px; border-left: 5px solid #ff4b4b; }
+    </style>
+    """, unsafe_allow_html=True)
 
 # =========================
-# 2. PATHS & CONSTANTS
+# 2. PATHS & ASSETS
 # =========================
 PROJECT = Path(__file__).resolve().parent
 DATA_PATH = PROJECT / "cdk2_pic50_clean.parquet"
 MODEL_PATH = PROJECT / "cdk2_rf_final_all_data.joblib"
 MODEL_DRIVE_FILE_ID = "1pOgZVHG7BfrcXE7ZmHJNM9CMnsBNlCQa"
 
-FP_RADIUS = 2
-FP_NBITS = 2048
-SIM_HIGH = 0.50
-SIM_MED = 0.30
+# =========================
+# 3. CORE ANALYTICAL ENGINES
+# =========================
+def download_model(file_id: str, dest: Path):
+    gdown.download(id=file_id, output=str(dest), quiet=False)
+
+@st.cache_resource
+def get_pains_filter():
+    params = FilterCatalogParams()
+    params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
+    return FilterCatalog(params)
+
+@st.cache_resource
+def load_assets():
+    if not MODEL_PATH.exists():
+        download_model(MODEL_DRIVE_FILE_ID, MODEL_PATH)
+    model = joblib.load(MODEL_PATH)
+    data = pd.read_parquet(DATA_PATH)
+    return model, data
+
+def calculate_ligand_efficiency(pic50: float, mol: Chem.Mol) -> float:
+    # LE = (1.37 / HeavyAtomCount) * pIC50
+    n_heavy = mol.GetNumHeavyAtoms()
+    return (1.37 / n_heavy) * pic50 if n_heavy > 0 else 0.0
+
+def check_pains(mol: Chem.Mol, catalog: FilterCatalog) -> list[str]:
+    entries = catalog.GetMatches(mol)
+    return [e.GetDescription() for e in entries]
 
 # =========================
-# 3. SECURE DOWNLOAD HANDLER
+# 4. DATA PROCESSING
 # =========================
-def download_model_from_drive(file_id: str, destination: Path) -> None:
-    gdown.download(id=file_id, output=str(destination), quiet=False)
-
-if not DATA_PATH.exists():
-    st.error(f"❌ Dataset not found: {DATA_PATH}")
-    st.stop()
-
-if not MODEL_PATH.exists():
-    with st.spinner("Downloading Scientific Model (First boot only)..."):
-        try:
-            download_model_from_drive(MODEL_DRIVE_FILE_ID, MODEL_PATH)
-        except Exception as e:
-            st.error(f"Failed to download model: {e}")
-            st.stop()
-
-# =========================
-# 4. SCIENTIFIC HELPERS
-# =========================
-def pic50_to_ic50_nM(pic50: float) -> float:
-    return float(10 ** (9.0 - pic50))
-
-def mol_from_smiles(smiles: str) -> Optional[Chem.Mol]:
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None: return None
-    Chem.SanitizeMol(mol)
-    return mol
-
-def draw_mol_png(mol: Chem.Mol, size=(400, 250)) -> bytes:
-    img = Draw.MolToImage(mol, size=size)
+def mol_to_png(mol: Chem.Mol):
+    img = Draw.MolToImage(mol, size=(450, 300))
     buf = BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-def morgan_fp(mol: Chem.Mol, radius: int = FP_RADIUS, n_bits: int = FP_NBITS):
-    return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
-
-def fp_to_numpy(fp, n_bits: int = FP_NBITS) -> np.ndarray:
-    arr = np.zeros((n_bits,), dtype=np.uint8)
+def rf_predict(model, mol: Chem.Mol):
+    fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+    arr = np.zeros((1,), dtype=np.int8)
     DataStructs.ConvertToNumpyArray(fp, arr)
-    return arr
-
-def compute_descriptors(mol: Chem.Mol) -> dict:
-    return {
-        "MolWt": float(Descriptors.MolWt(mol)), "LogP": float(Descriptors.MolLogP(mol)),
-        "TPSA": float(rdMolDescriptors.CalcTPSA(mol)), "HBD": int(rdMolDescriptors.CalcNumHBD(mol)),
-        "HBA": int(rdMolDescriptors.CalcNumHBA(mol)), "RotB": int(rdMolDescriptors.CalcNumRotatableBonds(mol)),
-        "Rings": int(rdMolDescriptors.CalcNumRings(mol)), "QED": float(QED.qed(mol)),
-    }
-
-def potency_bucket(pic50: float) -> str:
-    if pic50 >= 8.0: return "Strong (≥ 8.0)"
-    if pic50 >= 6.0: return "Moderate (6.0 - 8.0)"
-    return "Weak (< 6.0)"
-
-def improvement_suggestions(d: dict, max_sim: float) -> list[str]:
-    s = []
-    if d["LogP"] > 4.5: s.append("LogP high: Consider adding polar groups.")
-    if d["TPSA"] > 140: s.append("TPSA high: Potential permeability issues.")
-    if d["RotB"] > 10: s.append("High flexibility: Consider rigidification.")
-    if max_sim < SIM_MED: s.append("Low similarity to training data: Use caution.")
-    if not s: s.append("No major red flags detected.")
-    return s
+    X = arr.reshape(1, -1)
+    preds = np.array([t.predict(X)[0] for t in model.estimators_])
+    return float(preds.mean()), float(preds.std())
 
 # =========================
-# 5. DATA & MODEL LOADING
+# 5. PROFESSIONAL DASHBOARD
 # =========================
-@st.cache_data
-def load_data() -> pd.DataFrame:
-    return pd.read_parquet(DATA_PATH)
+st.title("🧪 CDK2 Pharmacological Diagnostic Suite")
+st.markdown("### Advanced QSAR Prediction & Chemical Asset Validation")
 
-@st.cache_resource
-def load_model():
-    return joblib.load(MODEL_PATH)
+try:
+    model, df = load_assets()
+    pains_catalog = get_pains_filter()
+except Exception as e:
+    st.error(f"System Error in Asset Loading: {e}")
+    st.stop()
 
-@st.cache_resource
-def build_dataset_fps(df: pd.DataFrame):
-    fps, idx = [], []
-    for i, s in enumerate(df["smiles"].astype(str).tolist()):
-        m = Chem.MolFromSmiles(s)
-        if m is not None:
-            fps.append(morgan_fp(m))
-            idx.append(i)
-    return fps, np.array(idx, dtype=int)
+# Interactive Filter Block
+st.sidebar.header("🎚️ Global Dataset Filters")
+p_min, p_max = float(df["pic50"].min()), float(df["pic50"].max())
+pic_range = st.sidebar.slider("pIC50 Selection", p_min, p_max, (p_min, p_max))
+df_f = df[(df["pic50"] >= pic_range[0]) & (df["pic50"] <= pic_range[1])]
 
-def rf_predict_with_uncertainty(model, X: np.ndarray) -> Tuple[float, float]:
-    preds = np.array([t.predict(X)[0] for t in model.estimators_], dtype=float)
-    return float(preds.mean()), float(preds.std(ddof=1))
+tab1, tab2, tab3 = st.tabs(["🧬 Diagnostic Lead", "📊 Subset Analytics", "📖 Documentation"])
 
-def build_real_examples_from_dataset(df: pd.DataFrame) -> dict[str, str]:
-    out: dict[str, str] = {}
-    dff = df.dropna(subset=["pic50", "smiles"]).sort_values("pic50", ascending=False)
-    if not dff.empty:
-        out[f"Strong Binder (pIC50 {dff.iloc[0]['pic50']:.2f})"] = str(dff.iloc[0]["smiles"])
-        mid = len(dff)//2
-        out[f"Moderate Binder (pIC50 {dff.iloc[mid]['pic50']:.2f})"] = str(dff.iloc[mid]["smiles"])
-    return out
-
-# =========================
-# 6. UI
-# =========================
-st.title("🧬 ChemBLitz: CDK2 pIC50 Predictor")
-
-df = load_data()
-examples = build_real_examples_from_dataset(df)
-
-if "smiles" not in st.session_state:
-    st.session_state["smiles"] = list(examples.values())[0]
-
-tab_pred, tab_val, tab_data, tab_about = st.tabs(["Prediction", "Nearest Neighbors", "Dashboard", "Methodology"])
-
-with tab_pred:
-    col_input, col_output = st.columns([1, 1.2], gap="large")
+with tab1:
+    col_input, col_results = st.columns([1, 1.3], gap="large")
     
     with col_input:
-        st.subheader("Query Setup")
-        ex = st.selectbox("Load Dataset Example:", list(examples.keys()))
-        if st.button("Use Example", use_container_width=True):
-            st.session_state["smiles"] = examples[ex]
-            
-        st.session_state["smiles"] = st.text_input("SMILES String:", value=st.session_state["smiles"])
-        run = st.button("Predict Potency", type="primary", use_container_width=True)
+        st.subheader("I. Query Definition")
+        ex_options = {"Custom Input": ""}
+        top_binders = df.sort_values("pic50", ascending=False).head(5)
+        for _, r in top_binders.iterrows():
+            ex_options[f"Ref: {r['molecule_chembl_id']} (pIC50 {r['pic50']:.1f})"] = r['smiles']
+        
+        selected_ex = st.selectbox("Reference Ligands", list(ex_options.keys()))
+        input_smiles = st.text_input("Target SMILES", value=ex_options[selected_ex] if selected_ex != "Custom Input" else "")
+        
+        analyze = st.button("Execute Full Diagnostic", type="primary", use_container_width=True)
 
-        st.markdown("---")
-        st.subheader("Dataset Filters")
-        p_min, p_max = float(df["pic50"].min()), float(df["pic50"].max())
-        p_range = st.slider("pIC50 Threshold", p_min, p_max, (p_min, p_max))
-        min_n = st.slider("Min measurements", 1, int(df["n_measurements"].max()), 1)
-        df_f = df[(df["pic50"] >= p_range[0]) & (df["pic50"] <= p_range[1]) & (df["n_measurements"] >= min_n)]
-
-    with col_output:
-        if run:
-            mol = mol_from_smiles(st.session_state["smiles"])
-            if mol:
-                model = load_model()
-                fp = morgan_fp(mol)
-                X = fp_to_numpy(fp).reshape(1, -1)
-                p_val, p_std = rf_predict_with_uncertainty(model, X)
-                
-                with st.container(border=True):
-                    st.markdown("### Prediction Results")
-                    c1, c2 = st.columns([1, 2])
-                    c1.image(draw_mol_png(mol))
-                    c2.metric("Predicted pIC50", f"{p_val:.3f}")
-                    c2.metric("Predicted IC50 (nM)", f"{pic50_to_ic50_nM(p_val):,.1f}")
-                    c2.write(f"**Classification:** {potency_bucket(p_val)}")
-                
-                with st.container(border=True):
-                    st.markdown("### ADMET & Suggestions")
-                    d = compute_descriptors(mol)
-                    st.write(f"**MolWt:** {d['MolWt']:.1f} | **LogP:** {d['LogP']:.2f} | **QED:** {d['QED']:.2f}")
-                    for s in improvement_suggestions(d, 0.5):
-                        st.markdown(f"- {s}")
+    with col_results:
+        if analyze and input_smiles:
+            mol = Chem.MolFromSmiles(input_smiles)
+            if not mol:
+                st.error("Structure Error: Invalid SMILES format.")
             else:
-                st.error("Invalid SMILES.")
+                p_mean, p_std = rf_predict(model, mol)
+                le_score = calculate_ligand_efficiency(p_mean, mol)
+                pains_hits = check_pains(mol, pains_catalog)
+                scaffold = Scaffolds.MurckoScaffold.GetScaffoldForMol(mol)
+                
+                # --- Result Panel 1: Potency & Efficiency ---
+                with st.container(border=True):
+                    st.markdown("#### Section A: Binding Affinity & Efficiency")
+                    cA, cB = st.columns([1, 2])
+                    cA.image(mol_to_png(mol), caption="Query Topology")
+                    with cB:
+                        m1, m2 = st.columns(2)
+                        m1.metric("Pred. pIC50", f"{p_mean:.2f}")
+                        m2.metric("Ligand Efficiency", f"{le_score:.2f}", help="LE > 0.3 is target for lead discovery.")
+                        st.info(f"Uncertainty (σ): ±{p_std:.3f}")
+
+                # --- Result Panel 2: Safety & Structural Integrity ---
+                with st.container(border=True):
+                    st.markdown("#### Section B: Structural Alert Analysis")
+                    if pains_hits:
+                        st.warning(f"⚠️ PAINS Alerts Detected: {', '.join(pains_hits)}")
+                    else:
+                        st.success("✅ No PAINS Structural Alerts (High-Quality Lead)")
+                    
+                    st.markdown(f"**Murcko Scaffold:** `{Chem.MolToSmiles(scaffold)}`")
+
+                # --- Result Panel 3: ADMET Descriptor Profile ---
+                with st.container(border=True):
+                    st.markdown("#### Section C: Physiochemical Optimization")
+                    d = {
+                        "MW": Descriptors.MolWt(mol),
+                        "LogP": Descriptors.MolLogP(mol),
+                        "HBD": rdMolDescriptors.CalcNumHBD(mol),
+                        "TPSA": rdMolDescriptors.CalcTPSA(mol)
+                    }
+                    d1, d2, d3, d4 = st.columns(4)
+                    d1.metric("MolWt", f"{d['MW']:.1f}")
+                    d2.metric("LogP", f"{d['LogP']:.2f}")
+                    d3.metric("HBD", d['HBD'])
+                    d4.metric("TPSA", f"{d['TPSA']:.1f}")
         else:
-            st.info("Enter SMILES and click Predict.")
+            st.info("System Ready. Define Query and Execute Diagnostic.")
 
-with tab_val:
-    st.subheader("Nearest Neighbors Analysis")
-    if st.button("Compute Neighbors", type="primary"):
-        mol_q = mol_from_smiles(st.session_state["smiles"])
-        if mol_q:
-            fp_q = morgan_fp(mol_q)
-            fps_nn, idx_map = build_dataset_fps(df_f)
-            # FIX: Added the missing 0 for the comparison
-            if len(fps_nn) > 0:
-                sims = np.array(DataStructs.BulkTanimotoSimilarity(fp_q, fps_nn))
-                top = np.argsort(-sims)[:10]
-                rows = [{"Similarity": f"{sims[j]:.3f}", "Exp. pIC50": df_f.iloc[idx_map[j]]["pic50"]} for j in top]
-                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+with tab2:
+    st.subheader("Global Chemical Space Dashboard")
+    st.plotly_chart(px.scatter(df_f, x="pic50", y="ic50_nM", size="n_measurements", hover_name="molecule_chembl_id", title="Structure-Activity Relationship (Filtered Subset)"), use_container_width=True)
 
-with tab_data:
-    st.subheader("Dataset Dashboard")
-    if not df_f.empty:
-        st.plotly_chart(px.histogram(df_f, x="pic50", title="pIC50 Distribution"), use_container_width=True)
+with tab3:
+    st.markdown("""
+    ### Technical Specification
+    - **Architecture:** RandomForest Regression (2048-bit Morgan Fingerprints, r=2).
+    - **Safety:** PAINS (Pan-Assay Interference) filters enabled.
+    - **Optimization:** Metrics include Ligand Efficiency (LE) for normalization.
+    """)
